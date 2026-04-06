@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from rich.console import Console
+from rich.console import Group
+from rich.live import Live
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.prompt import Prompt
@@ -11,11 +14,11 @@ from rich.text import Text
 
 from aca.approval import ApprovalPolicy, ApprovalRequest
 from aca.config import get_allowed_openrouter_models, get_settings, resolve_openrouter_model
-from aca.master import OpenRouterMasterClassifier
 from aca.llm.providers import OpenRouterProvider
+from aca.orchestration import NeonOrchestrator
+from aca.orchestration.state import NeonGuardrailError
 from aca.prompts import COMMAND_HELP, WELCOME_BANNER, WELCOME_NAME_PROMPT, WELCOME_SUBTITLE, WELCOME_TITLE
 from aca.runtime import ToolLoopRuntime
-from aca.services import TriageOrchestrator
 from aca.services.chat import ChatService
 from aca.storage import initialize_storage
 
@@ -58,20 +61,19 @@ class ChatCLIApp:
         self.storage = initialize_storage(self.settings)
         self.provider = OpenRouterProvider(title="ACA-CLI")
         self.runtime = ToolLoopRuntime(provider=self.provider, tool_registry={})
-        self.classifier = OpenRouterMasterClassifier(title="ACA-CLI-Master-Classifier")
         self.chat_service = ChatService(
             session_factory=self.storage.session_factory,
             runtime=self.runtime,
         )
-        self.triage = TriageOrchestrator(
+        self.triage = NeonOrchestrator(
             session_factory=self.storage.session_factory,
             provider=self.provider,
-            classifier=self.classifier,
             approval_policy=TerminalApprovalPolicy(self.console),
         )
         self.state: CliSessionState | None = None
 
     def run(self) -> None:
+        self.triage.sweep_archives()
         user = self.chat_service.get_single_user()
         if user is None:
             user = self._run_first_launch()
@@ -87,13 +89,7 @@ class ChatCLIApp:
             thinking_enabled=conversation.thinking_enabled,
         )
 
-        self.console.print(
-            Panel.fit(
-                COMMAND_HELP,
-                title="[bold magenta]Commands[/bold magenta]",
-                border_style="bright_cyan",
-            )
-        )
+        self.console.print("[dim]Type [bold]/show[/bold] to see all commands.[/dim]")
         self.console.print(self._conversation_header(conversation.title))
 
         while True:
@@ -266,7 +262,12 @@ class ChatCLIApp:
                 "yes" if conversation.id == self.state.active_conversation_id else "",
             )
 
-        self.console.print(table)
+        _CHAT_PAGE_SIZE = 12
+        if len(conversations) > _CHAT_PAGE_SIZE:
+            with self.console.pager():
+                self.console.print(table)
+        else:
+            self.console.print(table)
         choice = Prompt.ask("[bold cyan]Select chat number to switch, or press Enter to cancel[/bold cyan]", default="")
         if not choice:
             return
@@ -314,34 +315,80 @@ class ChatCLIApp:
         if self.state is None:
             return
 
-        spinner = self.console.status("[bold magenta]Neon relay warming up...[/bold magenta]", spinner="dots")
+        spinner = self.console.status("[bold magenta]thinking...[/bold magenta]", spinner="dots")
         spinner.start()
         active_streams: set[tuple[str, str]] = set()
         last_stream_type: str | None = None
-        stream_source = getattr(self, "triage", None)
-        use_legacy_stream = stream_source is None
+        live_markdown: Live | None = None
+        live_markdown_key: tuple[str, str] | None = None
+        live_markdown_buffer = ""
 
-        try:
-            event_iterator = (
-                self.chat_service.stream_chat_turn(
-                    conversation_id=self.state.active_conversation_id,
-                    user_input=raw_text,
-                    model=self.state.active_model,
-                    thinking_enabled=self.state.thinking_enabled,
+        def stop_live_markdown() -> None:
+            nonlocal live_markdown, live_markdown_key, live_markdown_buffer
+            if live_markdown is not None:
+                live_markdown.stop()
+            live_markdown = None
+            live_markdown_key = None
+            live_markdown_buffer = ""
+
+        def render_markdown_stream(label: str, chunk: str) -> None:
+            nonlocal live_markdown, live_markdown_key, live_markdown_buffer
+            key = (label, "text")
+            if live_markdown_key != key:
+                stop_live_markdown()
+                header = Text()
+                header.append(label, style="bold magenta")
+                header.append("> ")
+                live_markdown_buffer = chunk
+                live_markdown = Live(
+                    Group(header, Markdown(live_markdown_buffer)),
+                    console=self.console,
+                    auto_refresh=False,
+                    vertical_overflow="visible",
+                    transient=False,
                 )
-                if use_legacy_stream
-                else self.triage.stream_turn(
-                    conversation_id=self.state.active_conversation_id,
-                    user_input=raw_text,
-                    model=self.state.active_model,
-                    thinking_enabled=self.state.thinking_enabled,
-                )
+                live_markdown.start()
+                live_markdown_key = key
+                live_markdown.refresh()
+                return
+            live_markdown_buffer += chunk
+            live_markdown.update(
+                Group(
+                    Text.assemble((label, "bold magenta"), ("> ", "")),
+                    Markdown(live_markdown_buffer),
+                ),
+                refresh=True,
             )
 
+        def print_markdown_once(label: str, content: str) -> None:
+            header = Text()
+            header.append(label, style="bold magenta")
+            header.append("> ")
+            self.console.print(Group(header, Markdown(content)))
+
+        try:
+            triage = getattr(self, "triage", None)
+            use_chat_service = triage is None
+            if use_chat_service:
+                event_iterator = self.chat_service.stream_chat_turn(
+                    conversation_id=self.state.active_conversation_id,
+                    user_input=raw_text,
+                    model=self.state.active_model,
+                    thinking_enabled=self.state.thinking_enabled,
+                )
+            else:
+                event_iterator = triage.stream_turn(
+                    conversation_id=self.state.active_conversation_id,
+                    user_input=raw_text,
+                    model=self.state.active_model,
+                    thinking_enabled=self.state.thinking_enabled,
+                )
+
             for event in event_iterator:
-                if use_legacy_stream:
+                if use_chat_service:
                     if event.type == "reasoning.delta":
                         spinner.stop()
+                        stop_live_markdown()
                         if ("assistant", "reasoning") not in active_streams:
                             self.console.print("[italic bright_black]thinking[/italic bright_black]> ", end="")
                             active_streams.add(("assistant", "reasoning"))
@@ -359,20 +406,18 @@ class ChatCLIApp:
                         if ("assistant", "text") not in active_streams:
                             if last_stream_type == "reasoning":
                                 self.console.print()
-                            self.console.print("[bold magenta]assistant[/bold magenta]> ", end="")
                             active_streams.add(("assistant", "text"))
-                        self.console.print(event.text or "", end="", soft_wrap=True, highlight=False)
+                        render_markdown_stream("assistant", event.text or "")
                         last_stream_type = "text"
                         continue
 
                     if event.type == "completed" and event.summary is not None:
                         spinner.stop()
+                        stop_live_markdown()
                         if last_stream_type == "reasoning":
                             self.console.print()
                         if ("assistant", "text") not in active_streams:
-                            self.console.print("[bold magenta]assistant[/bold magenta]> ", end="")
-                            self.console.print(event.final_answer or "", end="", soft_wrap=True, highlight=False)
-                        self.console.print()
+                            print_markdown_once("assistant", event.final_answer or "")
                         self.console.print(
                             self._token_status(
                                 event.summary.total_input_tokens,
@@ -384,14 +429,10 @@ class ChatCLIApp:
                     continue
 
                 if event.type == "phase.started":
-                    spinner.stop()
                     label = event.agent or "agent"
-                    phase = event.phase or "phase"
-                    phase_text = f"[{phase}]"
-                    if event.message:
-                        self._print_agent_line(label, f"{phase_text} {event.message}")
-                    else:
-                        self._print_agent_line(label, phase_text)
+                    # Suppress internal routing noise; just keep the spinner alive
+                    if event.message and event.message != "Routing the request.":
+                        spinner.update(f"[bold magenta]{event.message}[/bold magenta]")
                     active_streams.discard((label, "reasoning"))
                     active_streams.discard((label, "text"))
                     last_stream_type = None
@@ -399,6 +440,7 @@ class ChatCLIApp:
 
                 if event.type == "reasoning.delta":
                     spinner.stop()
+                    stop_live_markdown()
                     label = event.agent or "agent"
                     if (label, "reasoning") not in active_streams:
                         if last_stream_type == "text":
@@ -415,38 +457,41 @@ class ChatCLIApp:
                     if (label, "text") not in active_streams:
                         if last_stream_type == "reasoning":
                             self.console.print()
-                        self.console.print(f"[bold magenta]{label}[/bold magenta]> ", end="")
                         active_streams.add((label, "text"))
-                    self.console.print(event.text or "", end="", soft_wrap=True, highlight=False)
+                    render_markdown_stream(label, event.text or "")
                     last_stream_type = "text"
                     continue
 
                 if event.type == "worker.status":
+                    # Show a compact tool-call indicator, then resume spinning
                     spinner.stop()
+                    stop_live_markdown()
                     if last_stream_type in {"reasoning", "text"}:
                         self.console.print()
-                    self._print_agent_line(event.agent or "worker", event.message or "")
+                    self._print_tool_call_line(event.agent or "neon", event.message or "")
+                    spinner.start()
                     last_stream_type = None
                     continue
 
                 if event.type == "phase.completed":
-                    spinner.stop()
+                    stop_live_markdown()
                     if last_stream_type in {"reasoning", "text"}:
+                        spinner.stop()
                         self.console.print()
                     if event.message:
+                        spinner.stop()
                         self._print_agent_line(event.agent or "agent", event.message)
+                        spinner.start()
                     last_stream_type = None
                     continue
 
                 if event.type == "completed" and event.summary is not None:
                     spinner.stop()
+                    stop_live_markdown()
                     if last_stream_type == "reasoning":
                         self.console.print()
                     if last_stream_type != "text":
-                        spinner.stop()
-                        self.console.print(f"[bold magenta]{event.agent or 'assistant'}[/bold magenta]> ", end="")
-                        self.console.print(event.final_answer or "", end="", soft_wrap=True, highlight=False)
-                    self.console.print()
+                        print_markdown_once(event.agent or "assistant", event.final_answer or "")
                     self.console.print(
                         self._token_status(
                             event.summary.total_input_tokens,
@@ -455,7 +500,16 @@ class ChatCLIApp:
                         )
                     )
                     break
+        except NeonGuardrailError:
+            stop_live_markdown()
+            spinner.stop()
+            self.console.print("[bold red]neon[/bold red]> I hit a workflow guardrail and could not recover cleanly. Please retry the request once.")
+        except Exception as exc:
+            stop_live_markdown()
+            spinner.stop()
+            self.console.print(f"[bold red]aca[/bold red]> Unexpected error: {exc}")
         finally:
+            stop_live_markdown()
             spinner.stop()
 
     def _print_agent_line(self, label: str, message: str) -> None:
@@ -464,6 +518,15 @@ class ChatCLIApp:
         line.append("> ")
         if message:
             line.append(message)
+        self.console.print(line)
+
+    def _print_tool_call_line(self, agent: str, message: str) -> None:
+        line = Text()
+        line.append("  ◆ ", style="bold bright_cyan")
+        line.append(agent, style="dim magenta")
+        if message:
+            line.append("  ", style="")
+            line.append(message, style="dim")
         self.console.print(line)
 
     def _resolve_model_choice(self, choice: str, options: list[tuple[str, str]]) -> str | None:

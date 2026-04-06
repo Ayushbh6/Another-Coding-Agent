@@ -440,9 +440,14 @@ class WorkspaceToolRegistry:
             if part in IGNORED_DIRECTORY_NAMES:
                 return True
         relative_posix = relative.as_posix()
+        ignored = False
         for pattern in self._ignore_patterns:
-            if self._matches_ignore_pattern(relative_posix, pattern):
-                return True
+            is_negated = pattern.startswith("!")
+            candidate = pattern[1:] if is_negated else pattern
+            if self._matches_ignore_pattern(relative_posix, candidate):
+                ignored = not is_negated
+        if ignored:
+            return True
         return self._is_sensitive_path(relative)
 
     def _is_sensitive_path(self, relative: Path) -> bool:
@@ -455,6 +460,11 @@ class WorkspaceToolRegistry:
 
     def _ensure_safe_to_read(self, resolved: Path) -> None:
         relative = resolved.relative_to(self._context.root.resolve())
+        if relative.parts and relative.parts[0] == ".aca":
+            raise ValueError(
+                f"Cannot read .aca internal path via read_file: {relative}. "
+                "Use read_task_artifact to read task workspace files."
+            )
         if self._is_ignored_path(relative):
             raise ValueError(f"Access denied to sensitive or ignored path: {relative}")
 
@@ -470,7 +480,7 @@ class WorkspaceToolRegistry:
                 continue
             for raw_line in content.splitlines():
                 line = raw_line.strip()
-                if not line or line.startswith("#") or line.startswith("!"):
+                if not line or line.startswith("#"):
                     continue
                 patterns.append(line)
         return tuple(patterns)

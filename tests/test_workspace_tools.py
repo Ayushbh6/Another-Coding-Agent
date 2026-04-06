@@ -113,6 +113,24 @@ class WorkspaceToolRegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             registry.read_file(".env")
 
+    def test_gitignore_negation_allows_readme(self) -> None:
+        (self.root / ".gitignore").write_text("*.md\n!README.md\n", encoding="utf-8")
+        (self.root / "README.md").write_text("# Hello\n", encoding="utf-8")
+        registry = WorkspaceToolRegistry(
+            WorkspaceToolContext(
+                root=self.root,
+                session_factory=self.storage.session_factory,
+                task_id=None,
+                agent_id="worker",
+                approval_policy=AllowAllApprovalPolicy(),
+            )
+        )
+
+        result = json.loads(registry.read_file("README.md"))
+
+        self.assertEqual(result["path"], "README.md")
+        self.assertIn("Hello", result["content"])
+
     def test_read_file_supports_partial_ranges_and_char_truncation(self) -> None:
         (self.root / "src" / "multi.py").write_text(
             "line one\nline two\nline three\nline four\n",

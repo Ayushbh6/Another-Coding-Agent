@@ -105,6 +105,19 @@ class ToolLoopRuntime:
             provider_runs.append(run_result)
             working_history.append(run_result.assistant_message)
 
+            # Emit per-LLM-call usage so orchestrators can track tokens in real-time,
+            # even when the tool-loop stream is closed early (boundary restarts, handoffs).
+            yield ProviderEvent(
+                type="usage.update",
+                metadata={
+                    "iteration": iteration,
+                    "input_tokens": run_result.usage.input_tokens or 0,
+                    "output_tokens": run_result.usage.output_tokens or 0,
+                    "total_tokens": run_result.usage.total_tokens or 0,
+                    "response_id": run_result.response_id,
+                },
+            )
+
             if run_result.reasoning:
                 reasoning_trace.append(run_result.reasoning)
 
@@ -201,12 +214,16 @@ class ToolLoopRuntime:
                 ok=True,
             )
         except Exception as exc:  # noqa: BLE001
+            error_payload: dict[str, Any] = {"error": str(exc)}
+            code = getattr(exc, "code", None)
+            if isinstance(code, str):
+                error_payload["steering_code"] = code
             return ToolExecutionRecord(
                 iteration=iteration,
                 tool_name=tool_call.name,
                 tool_call_id=tool_call.id,
                 arguments=arguments,
-                result=json.dumps({"error": str(exc)}),
+                result=json.dumps(error_payload),
                 ok=False,
             )
 

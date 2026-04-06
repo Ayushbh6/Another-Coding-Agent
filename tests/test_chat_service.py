@@ -353,7 +353,8 @@ class ChatCliRenderingTests(unittest.TestCase):
 
         output = app.console.export_text()
         self.assertIn("thinking> Analyzing the request. Choosing next step.", output)
-        self.assertIn("assistant> Final answer.", output)
+        self.assertIn("assistant>", output)
+        self.assertIn("Final answer.", output)
 
 
 if __name__ == "__main__":
