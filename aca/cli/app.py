@@ -6,6 +6,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
+from rich.text import Text
 
 from aca.config import get_allowed_openrouter_models, get_settings, resolve_openrouter_model
 from aca.llm.providers import OpenRouterProvider
@@ -247,7 +248,9 @@ class ChatCLIApp:
 
         spinner = self.console.status("[bold magenta]Neon relay warming up...[/bold magenta]", spinner="dots")
         spinner.start()
-        started_stream = False
+        started_answer_stream = False
+        started_thinking_stream = False
+        last_stream_type: str | None = None
 
         try:
             for event in self.chat_service.stream_chat_turn(
@@ -256,17 +259,36 @@ class ChatCLIApp:
                 model=self.state.active_model,
                 thinking_enabled=self.state.thinking_enabled,
             ):
-                if event.type == "text.delta":
-                    if not started_stream:
+                if event.type == "reasoning.delta":
+                    if not started_thinking_stream:
                         spinner.stop()
+                        self.console.print("[italic bright_black]thinking[/italic bright_black]> ", end="")
+                        started_thinking_stream = True
+                    self.console.print(
+                        Text(event.thinking_text or "", style="italic bright_black"),
+                        end="",
+                        soft_wrap=True,
+                        highlight=False,
+                    )
+                    last_stream_type = "reasoning"
+                    continue
+
+                if event.type == "text.delta":
+                    if not started_answer_stream:
+                        spinner.stop()
+                        if last_stream_type == "reasoning":
+                            self.console.print()
                         self.console.print("[bold magenta]assistant[/bold magenta]> ", end="")
-                        started_stream = True
+                        started_answer_stream = True
                     self.console.print(event.text or "", end="", soft_wrap=True, highlight=False)
+                    last_stream_type = "text"
                     continue
 
                 if event.type == "completed" and event.summary is not None:
-                    if not started_stream:
+                    if not started_answer_stream:
                         spinner.stop()
+                        if last_stream_type == "reasoning":
+                            self.console.print()
                         self.console.print("[bold magenta]assistant[/bold magenta]> ", end="")
                         self.console.print(event.final_answer or "", end="", soft_wrap=True, highlight=False)
                     self.console.print()

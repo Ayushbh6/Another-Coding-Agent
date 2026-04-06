@@ -120,9 +120,17 @@ class FakeProvider(LLMProvider):
         return RunResult(
             provider=self.provider_name,
             model=request.model,
-            assistant_message=Message(role="assistant", content=text, tool_calls=tool_calls),
+            assistant_message=Message(
+                role="assistant",
+                content=text,
+                tool_calls=tool_calls,
+                reasoning=reasoning,
+                reasoning_details=[],
+            ),
             reasoning=reasoning,
+            reasoning_details=[],
             text=text,
+            structured_output=None,
             tool_calls=tool_calls,
             finish_reason="tool_calls" if tool_calls else "stop",
             usage=usage,

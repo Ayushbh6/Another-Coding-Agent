@@ -1,33 +1,26 @@
+from __future__ import annotations
+
+import argparse
 import json
-import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
-import requests
 from dotenv import load_dotenv
-from openai import OpenAI
+from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aca.config import OPENROUTER_MODELS, get_settings
-
-load_dotenv()
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL_ID = get_settings().default_openrouter_model
-# Available shared registry entries:
-# OPENROUTER_MODELS["minimax_m2_7"]
-# OPENROUTER_MODELS["kimi_k2_5"]
+from aca import create_agent
+from aca.config import get_settings
+from aca.llm.providers import OpenRouterProvider
+from aca.llm.types import ProviderEvent
 
 
-# ============================================================
-# TOOL DEFINITIONS
-# ============================================================
+class FinalAns(BaseModel):
+    final_ans: str
+    short_reason: str
+    confidence_score: float
+
 
 TOOLS = [
     {
@@ -40,12 +33,12 @@ TOOLS = [
                 "properties": {
                     "expression": {
                         "type": "string",
-                        "description": "The math expression to evaluate, e.g., '25 * 4 + 10'"
+                        "description": "The math expression to evaluate, e.g. '25 * 4 + 10'",
                     }
                 },
-                "required": ["expression"]
-            }
-        }
+                "required": ["expression"],
+            },
+        },
     },
     {
         "type": "function",
@@ -57,47 +50,42 @@ TOOLS = [
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "The text to analyze"
+                        "description": "The text to analyze",
                     }
                 },
-                "required": ["text"]
-            }
-        }
-    }
+                "required": ["text"],
+            },
+        },
+    },
 ]
 
 
-# ============================================================
-# TOOL IMPLEMENTATIONS
-# ============================================================
-
 def calculator(expression: str) -> str:
-    """Safely evaluate a mathematical expression."""
-    # Whitelist only safe characters
     allowed_chars = set("0123456789+-*/().^% ")
-    if not all(c in allowed_chars for c in expression):
+    if not all(char in allowed_chars for char in expression):
         return json.dumps({"error": "Invalid characters in expression"})
-    
+
     try:
-        # Safe eval with no builtins
-        result = eval(expression, {"__builtins__": {}}, {"^": "**"})
-        return json.dumps({"expression": expression, "result": result})
-    except Exception as e:
-        return json.dumps({"error": f"Evaluation error: {str(e)}"})
+        result = eval(expression.replace("^", "**"), {"__builtins__": {}}, {})  # noqa: S307
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"Evaluation error: {exc}"})
+
+    return json.dumps({"expression": expression, "result": result})
 
 
 def text_analyzer(text: str) -> str:
-    """Analyze text and return statistics."""
     words = text.split()
-    return json.dumps({
-        "original": text,
-        "word_count": len(words),
-        "char_count": len(text),
-        "char_count_no_spaces": len(text.replace(" ", "")),
-        "uppercase": text.upper(),
-        "lowercase": text.lower(),
-        "words_list": words
-    })
+    return json.dumps(
+        {
+            "original": text,
+            "word_count": len(words),
+            "char_count": len(text),
+            "char_count_no_spaces": len(text.replace(" ", "")),
+            "uppercase": text.upper(),
+            "lowercase": text.lower(),
+            "words_list": words,
+        }
+    )
 
 
 TOOL_REGISTRY = {
@@ -106,332 +94,137 @@ TOOL_REGISTRY = {
 }
 
 
-# ============================================================
-# AGENT IMPLEMENTATION - OpenAI SDK
-# ============================================================
+TEST_QUERIES = [
+    "What is 345 multiplied by 89, then add 1234 to the result?",
+    "Calculate (500 - 125) * 8, then analyze the text 'The result is X' where X is your calculated value. Use both tools before answering.",
+    "I have a rectangle with length 47 and width 23. Calculate the area and perimeter, then analyze the word 'rectangle'. Use the available tools.",
+]
 
-def create_openai_client() -> OpenAI:
-    """Create OpenAI client configured for OpenRouter."""
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is not set in the environment.")
 
-    return OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=OPENROUTER_API_KEY,
-        default_headers={
-            "HTTP-Referer": "http://localhost:8000",  # Optional: for rankings
-            "X-Title": "GLM5-Thinking-Agent"          # Optional: for rankings
-        }
+def build_agent(model: str) -> object:
+    provider = OpenRouterProvider(title="ACA-Create-Agent-Experiment")
+
+    return create_agent(
+        name="Tool Test Agent",
+        model=model,
+        instructions=(
+            "You are a tool-using test agent. "
+            "You must use the provided tools when the user asks for calculations or text analysis. "
+            "For this experiment, do not solve math or text-analysis tasks from memory. "
+            "Call calculator first for numeric work, then call text_analyzer when text analysis is requested. "
+            "After tool results are available, return only the final structured result."
+        ),
+        provider=provider,
+        tools=TOOLS,
+        tool_registry=TOOL_REGISTRY,
+        max_turns=12,
+        tool_choice="auto",
+        structured_output={
+            "name": "final_ans",
+            "strict": True,
+            "schema": FinalAns.model_json_schema(),
+        },
+        reasoning_enabled=True,
     )
 
 
-def run_agent_openai_sdk(
-    query: str,
-    model: str = MODEL_ID,
-    max_iterations: int = 10,
-    verbose: bool = True
-) -> Dict[str, Any]:
-    """
-    Run agent with interleaved thinking using OpenAI SDK.
-    
-    The thinking/reasoning tokens appear in separate fields in the response,
-    allowing true interleaved thinking between tool calls.
-    """
-    client = create_openai_client()
-    
-    messages: List[Dict] = [{"role": "user", "content": query}]
-    reasoning_trace: List[str] = []
-    tool_calls_log: List[Dict] = []
-    
-    def log(msg: str) -> None:
-        if verbose:
-            print(msg)
-    
-    for iteration in range(1, max_iterations + 1):
-        log(f"\n{'='*70}")
-        log(f"ITERATION {iteration}")
-        log(f"{'='*70}")
-        
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                # Extra body for OpenRouter-specific features
-                extra_body={
-                    "include_reasoning": True
-                }
+def parse_args() -> argparse.Namespace:
+    settings = get_settings()
+    parser = argparse.ArgumentParser(description="Run the reusable ACA agent abstraction against OpenRouter.")
+    parser.add_argument(
+        "--query-index",
+        type=int,
+        default=2,
+        choices=(1, 2, 3),
+        help="Pick one of the built-in tool-usage test prompts.",
+    )
+    parser.add_argument(
+        "--model",
+        default=settings.default_openrouter_model,
+        help="OpenRouter model id to test.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    load_dotenv()
+    args = parse_args()
+    query = TEST_QUERIES[args.query_index - 1]
+
+    agent = build_agent(args.model)
+    print("=" * 70)
+    print("CREATE_AGENT REAL API TEST")
+    print("=" * 70)
+    print(f"model: {args.model}")
+    print(f"query_index: {args.query_index}")
+    print(f"query: {query}")
+    print("stream: starting")
+
+    final_result = None
+    for event in agent.stream(query):
+        if event.type == "reasoning.delta":
+            print(f"[thinking] {event.delta}")
+            continue
+
+        if event.type == "tool_call.delta" and event.tool_call is not None:
+            print(
+                f"[tool-call.delta] name={event.tool_call.name} "
+                f"args_chunk={event.delta!r}"
             )
-        except Exception as e:
-            log(f"API Error: {e}")
-            # Fallback without reasoning params
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto"
+            continue
+
+        if event.type == "tool_call.completed" and event.tool_call is not None:
+            print(
+                f"[tool-call.completed] name={event.tool_call.name} "
+                f"args={event.tool_call.arguments}"
             )
-        
-        choice = response.choices[0]
-        message = choice.message
-        
-        # ---- EXTRACT REASONING/THINKING ----
-        # OpenRouter returns reasoning in different ways depending on model
-        thinking_text = None
-        
-        # Method 1: message.reasoning (some models)
-        if hasattr(message, 'reasoning') and message.reasoning:
-            thinking_text = message.reasoning
-        
-        # Method 2: Check response body for reasoning field
-        elif hasattr(response, 'reasoning') and response.reasoning:
-            thinking_text = response.reasoning
-        
-        # Method 3: Check in message content with special markers
-        elif message.content and "<think" in message.content:
-            # Some models embed thinking in content with XML tags
-            import re
-            think_match = re.search(r'<think[^>]*>(.*?)</think', message.content, re.DOTALL)
-            if think_match:
-                thinking_text = think_match.group(1).strip()
-        
-        if thinking_text:
-            log(f"\n🧠 THINKING:\n{thinking_text}")
-            reasoning_trace.append(thinking_text)
-        else:
-            log("\n🧠 (No thinking content returned)")
-        
-        # ---- CHECK FOR TOOL CALLS ----
-        if not message.tool_calls:
-            log(f"\n💬 FINAL ANSWER:\n{message.content}")
-            return {
-                "status": "complete",
-                "answer": message.content,
-                "reasoning_steps": reasoning_trace,
-                "tool_calls": tool_calls_log,
-                "iterations": iteration
-            }
-        
-        # ---- PROCESS TOOL CALLS ----
-        log(f"\n🔧 TOOL CALLS ({len(message.tool_calls)}):")
-        
-        # Add assistant message with tool calls to conversation
-        messages.append(message.model_dump(exclude_none=True))
-        
-        for tool_call in message.tool_calls:
-            func_name = tool_call.function.name
-            func_args = json.loads(tool_call.function.arguments)
-            
-            log(f"  → {func_name}({json.dumps(func_args)})")
-            
-            # Execute the tool
-            if func_name in TOOL_REGISTRY:
-                result = TOOL_REGISTRY[func_name](**func_args)
-            else:
-                result = json.dumps({"error": f"Unknown tool: {func_name}"})
-            
-            log(f"  ← {result[:200]}{'...' if len(result) > 200 else ''}")
-            
-            # Log for return value
-            tool_calls_log.append({
-                "iteration": iteration,
-                "tool": func_name,
-                "args": func_args,
-                "result": result
-            })
-            
-            # Add tool result to messages (required for conversation continuity)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result
-            })
-    
-    return {
-        "status": "max_iterations",
-        "answer": None,
-        "reasoning_steps": reasoning_trace,
-        "tool_calls": tool_calls_log,
-        "iterations": max_iterations
-    }
+            continue
 
+        if event.type == "runtime.tool_result":
+            tool_name = event.tool_call.name if event.tool_call is not None else "unknown"
+            print(f"[tool-result] name={tool_name} ok={event.metadata.get('ok')} result={event.delta}")
+            continue
 
-# ============================================================
-# AGENT IMPLEMENTATION - Direct HTTP (for debugging)
-# ============================================================
+        if event.type == "text.delta":
+            print(f"[text.delta] {event.delta}")
+            continue
 
-def run_agent_direct_http(
-    query: str,
-    model: str = MODEL_ID,
-    max_iterations: int = 10,
-    verbose: bool = True
-) -> Dict[str, Any]:
-    """
-    Run agent using direct HTTP requests to OpenRouter API.
-    Useful for debugging the exact request/response format.
-    """
-    
-    messages: List[Dict] = [{"role": "user", "content": query}]
-    reasoning_trace: List[str] = []
-    tool_calls_log: List[Dict] = []
-    
-    def log(msg: str) -> None:
-        if verbose:
-            print(msg)
-    
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost:8000",
-        "X-Title": "GLM5-Thinking-Agent"
-    }
-    
-    for iteration in range(1, max_iterations + 1):
-        log(f"\n{'='*70}")
-        log(f"ITERATION {iteration}")
-        log(f"{'='*70}")
-        
-        payload = {
-            "model": model,
-            "messages": messages,
-            "tools": TOOLS,
-            "tool_choice": "auto",
-            "include_reasoning": True
-        }
-        
-        if verbose:
-            log(f"\n📤 REQUEST (messages count: {len(messages)})")
-        
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload
-        )
-        
-        if response.status_code != 200:
-            log(f"\n❌ HTTP Error {response.status_code}: {response.text}")
-            return {
-                "status": "error",
-                "error": response.text,
-                "reasoning_steps": reasoning_trace,
-                "tool_calls": tool_calls_log,
-                "iterations": iteration
-            }
-        
-        data = response.json()
-        
-        if verbose:
-            # Print full response for debugging (truncate large fields)
-            debug_data = json.dumps(data, indent=2)
-            if len(debug_data) > 2000:
-                log(f"\n📥 RESPONSE (truncated):\n{debug_data[:2000]}...")
-            else:
-                log(f"\n📥 RESPONSE:\n{debug_data}")
-        
-        choice = data["choices"][0]
-        message = choice["message"]
-        
-        # ---- EXTRACT REASONING ----
-        thinking_text = None
-        
-        # Check various locations for reasoning
-        if "reasoning" in message and message["reasoning"]:
-            thinking_text = message["reasoning"]
-        elif "reasoning" in data and data["reasoning"]:
-            thinking_text = data["reasoning"]
-        elif "reasoning_content" in message and message["reasoning_content"]:
-            thinking_text = message["reasoning_content"]
-        
-        if thinking_text:
-            log(f"\n🧠 THINKING:\n{thinking_text}")
-            reasoning_trace.append(thinking_text)
-        
-        # ---- CHECK FOR TOOL CALLS ----
-        if "tool_calls" not in message or not message["tool_calls"]:
-            log(f"\n💬 FINAL ANSWER:\n{message.get('content', 'No content')}")
-            return {
-                "status": "complete",
-                "answer": message.get("content"),
-                "reasoning_steps": reasoning_trace,
-                "tool_calls": tool_calls_log,
-                "iterations": iteration,
-                "raw_response": data  # Include for debugging
-            }
-        
-        # ---- PROCESS TOOL CALLS ----
-        log(f"\n🔧 TOOL CALLS ({len(message['tool_calls'])}):")
-        
-        # Add assistant message to conversation
-        messages.append(message)
-        
-        for tool_call in message["tool_calls"]:
-            func_name = tool_call["function"]["name"]
-            func_args = json.loads(tool_call["function"]["arguments"])
-            
-            log(f"  → {func_name}({json.dumps(func_args)})")
-            
-            if func_name in TOOL_REGISTRY:
-                result = TOOL_REGISTRY[func_name](**func_args)
-            else:
-                result = json.dumps({"error": f"Unknown tool: {func_name}"})
-            
-            log(f"  ← {result[:200]}{'...' if len(result) > 200 else ''}")
-            
-            tool_calls_log.append({
-                "iteration": iteration,
-                "tool": func_name,
-                "args": func_args,
-                "result": result
-            })
-            
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call["id"],
-                "content": result
-            })
-    
-    return {
-        "status": "max_iterations",
-        "answer": None,
-        "reasoning_steps": reasoning_trace,
-        "tool_calls": tool_calls_log,
-        "iterations": max_iterations
-    }
+        if event.type == "run.completed":
+            final_result = event.result
+            print("[run.completed]")
 
+    result = final_result
+    if result is None:
+        raise RuntimeError("Agent stream ended without a final result.")
 
-# ============================================================
-# TESTING
-# ============================================================
+    print(f"status: {result.status}")
+    print(f"iterations: {result.iterations}")
+    print(f"reasoning_steps: {len(result.reasoning_trace)}")
+    print(f"tool_executions: {len(result.tool_executions)}")
+
+    for index, execution in enumerate(result.tool_executions, start=1):
+        print(f"\nTOOL #{index}")
+        print(f"name: {execution.tool_name}")
+        print(f"arguments: {json.dumps(execution.arguments)}")
+        print(f"ok: {execution.ok}")
+        print(f"result: {execution.result}")
+
+    if result.provider_runs:
+        last_run = result.provider_runs[-1]
+        print("\nLAST PROVIDER RUN")
+        print(f"model: {last_run.model}")
+        print(f"finish_reason: {last_run.finish_reason}")
+        print(f"raw_text: {last_run.text}")
+        print(f"structured_output: {json.dumps(last_run.structured_output, indent=2)}")
+
+        if last_run.structured_output is not None:
+            parsed = FinalAns.model_validate(last_run.structured_output)
+            print("\nVALIDATED STRUCTURED OUTPUT")
+            print(parsed.model_dump_json(indent=2))
+
+    print("\nFINAL ANSWER")
+    print(result.final_answer)
+
 
 if __name__ == "__main__":
-    # Test queries that require thinking and tool use
-    
-    test_queries = [
-        # Simple tool use with thinking
-        "What is 345 multiplied by 89, then add 1234 to the result?",
-        
-        # Multi-step requiring multiple tool calls
-        "Calculate (500 - 125) * 8, then analyze the text 'The result is X' where X is your calculated value.",
-        
-        # Complex reasoning
-        "I have a rectangle with length 47 and width 23. Calculate the area and perimeter. Then analyze the word 'rectangle'."
-    ]
-    
-    # Run with OpenAI SDK
-    print("\n" + "#"*70)
-    print("# USING OPENAI SDK")
-    print("#"*70)
-    
-    result = run_agent_openai_sdk(
-        query=test_queries[1],
-        verbose=True
-    )
-    
-    print("\n" + "#"*70)
-    print("# SUMMARY")
-    print("#"*70)
-    print(f"Status: {result['status']}")
-    print(f"Iterations: {result['iterations']}")
-    print(f"Reasoning steps: {len(result['reasoning_steps'])}")
-    print(f"Tool calls made: {len(result['tool_calls'])}")
+    main()

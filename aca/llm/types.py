@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 
 MessageRole = Literal["system", "user", "assistant", "tool"]
+ImageDetail = Literal["auto", "low", "high"]
 
 
 class HistoryMode(str, Enum):
@@ -22,19 +23,41 @@ class ToolCall:
 
 
 @dataclass(slots=True)
+class TextContentPart:
+    text: str
+    type: Literal["text"] = "text"
+
+
+@dataclass(slots=True)
+class ImageContentPart:
+    image_url: str
+    detail: ImageDetail | None = None
+    type: Literal["image_url"] = "image_url"
+
+
+ContentPart = TextContentPart | ImageContentPart
+
+
+@dataclass(slots=True)
 class Message:
     role: MessageRole
-    content: str | None = None
+    content: str | list[ContentPart] | None = None
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    reasoning: str | None = None
+    reasoning_details: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_provider_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"role": self.role}
 
         if self.content is not None:
-            payload["content"] = self.content
+            payload["content"] = (
+                [self._serialize_content_part(part) for part in self.content]
+                if isinstance(self.content, list)
+                else self.content
+            )
 
         if self.name:
             payload["name"] = self.name
@@ -55,7 +78,22 @@ class Message:
                 for tool_call in self.tool_calls
             ]
 
+        if self.reasoning:
+            payload["reasoning"] = self.reasoning
+
+        if self.reasoning_details:
+            payload["reasoning_details"] = self.reasoning_details
+
         return payload
+
+    def _serialize_content_part(self, part: ContentPart) -> dict[str, Any]:
+        if isinstance(part, TextContentPart):
+            return {"type": part.type, "text": part.text}
+
+        image_payload: dict[str, Any] = {"url": part.image_url}
+        if part.detail:
+            image_payload["detail"] = part.detail
+        return {"type": part.type, "image_url": image_payload}
 
 
 @dataclass(slots=True)
@@ -75,6 +113,10 @@ class ProviderRequest:
     messages: list[Message]
     tools: list[dict[str, Any]] = field(default_factory=list)
     tool_choice: str | dict[str, Any] = "auto"
+    parallel_tool_calls: bool | None = None
+    response_format: dict[str, Any] | None = None
+    reasoning: dict[str, Any] | None = None
+    provider: dict[str, Any] | None = None
     temperature: float | None = None
     max_tokens: int | None = None
     include_reasoning: bool = True
@@ -88,7 +130,9 @@ class RunResult:
     model: str
     assistant_message: Message
     reasoning: str
+    reasoning_details: list[dict[str, Any]]
     text: str
+    structured_output: Any | None
     tool_calls: list[ToolCall]
     finish_reason: str | None
     usage: UsageStats

@@ -36,6 +36,7 @@ class ConversationSummary:
 class ChatStreamEvent:
     type: str
     text: str | None = None
+    thinking_text: str | None = None
     final_answer: str | None = None
     summary: ConversationSummary | None = None
 
@@ -254,6 +255,10 @@ class ChatService:
                 include_reasoning=thinking_enabled,
             )
         ):
+            if event.type == "reasoning.delta":
+                yield ChatStreamEvent(type="reasoning.delta", thinking_text=event.delta)
+                continue
+
             if event.type == "text.delta":
                 yield ChatStreamEvent(type="text.delta", text=event.delta)
                 continue
@@ -277,7 +282,11 @@ class ChatService:
                 role="assistant",
                 message_kind="assistant_final",
                 content_text=final_answer,
-                content_json={"reasoning": provider_run.reasoning if provider_run is not None else ""},
+                content_json={
+                    "reasoning": provider_run.reasoning if provider_run is not None else "",
+                    "reasoning_details": provider_run.reasoning_details if provider_run is not None else [],
+                    "structured_output": provider_run.structured_output if provider_run is not None else None,
+                },
                 provider_name=provider_run.provider if provider_run is not None else None,
                 model_name=model,
                 thinking_enabled=thinking_enabled,
@@ -310,7 +319,12 @@ class ChatService:
             .order_by(ConversationMessage.sequence_no)
         ).all()
         return [
-            Message(role=row.role, content=row.content_text)
+            Message(
+                role=row.role,
+                content=row.content_text,
+                reasoning=(row.content_json or {}).get("reasoning") if row.role == "assistant" else None,
+                reasoning_details=(row.content_json or {}).get("reasoning_details", []) if row.role == "assistant" else [],
+            )
             for row in rows
             if row.role in {"user", "assistant"} and row.message_kind in {"user", "assistant_final"}
         ]

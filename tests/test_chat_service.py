@@ -3,16 +3,18 @@ from __future__ import annotations
 import tempfile
 import unittest
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
 
+from rich.console import Console
 from sqlalchemy import select
 
-from aca.cli.app import parse_command
+from aca.cli.app import ChatCLIApp, CliSessionState, parse_command
 from aca.config import Settings
 from aca.llm.providers.base import LLMProvider
 from aca.llm.types import Message, ProviderEvent, ProviderRequest, RunResult, UsageStats
 from aca.runtime import ToolLoopRuntime
-from aca.services.chat import CLEARED_MESSAGE_STATUS, ChatService, VISIBLE_MESSAGE_STATUS
+from aca.services.chat import CLEARED_MESSAGE_STATUS, ChatService, ChatStreamEvent, ConversationSummary, VISIBLE_MESSAGE_STATUS
 from aca.storage import initialize_storage
 from aca.storage.models import Conversation, ConversationMessage, User
 
@@ -22,6 +24,8 @@ class FakeStreamingProvider(LLMProvider):
 
     def stream_turn(self, request: ProviderRequest) -> Iterator[ProviderEvent]:
         text = "Streaming reply from the assistant."
+        yield ProviderEvent(type="reasoning.delta", delta="Let me think. ")
+        yield ProviderEvent(type="reasoning.delta", delta="Still thinking.")
         yield ProviderEvent(type="text.delta", delta="Streaming ")
         yield ProviderEvent(type="text.delta", delta="reply ")
         yield ProviderEvent(type="text.delta", delta="from the assistant.")
@@ -32,7 +36,9 @@ class FakeStreamingProvider(LLMProvider):
                 model=request.model,
                 assistant_message=Message(role="assistant", content=text),
                 reasoning="",
+                reasoning_details=[],
                 text=text,
+                structured_output=None,
                 tool_calls=[],
                 finish_reason="stop",
                 usage=UsageStats(input_tokens=8, output_tokens=6, total_tokens=14),
@@ -92,7 +98,10 @@ class ChatServiceTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual([event.type for event in events], ["text.delta", "text.delta", "text.delta", "completed"])
+        self.assertEqual(
+            [event.type for event in events],
+            ["reasoning.delta", "reasoning.delta", "text.delta", "text.delta", "text.delta", "completed"],
+        )
         completed = events[-1]
         self.assertIsNotNone(completed.summary)
         self.assertEqual(completed.summary.title, "How are tool")
@@ -216,12 +225,73 @@ class ChatServiceTests(unittest.TestCase):
                 [False, True, True, True],
             )
 
+    def test_thinking_events_are_streamed_when_provider_emits_reasoning(self) -> None:
+        user = self.chat_service.initialize_user("Aparajit")
+        conversation = self.chat_service.create_conversation_with_settings(
+            user_id=user.id,
+            active_model="fake-model",
+            thinking_enabled=True,
+        )
+
+        events = list(
+            self.chat_service.stream_chat_turn(
+                conversation_id=conversation.id,
+                user_input="Think before replying",
+                model="fake-model",
+                thinking_enabled=True,
+            )
+        )
+
+        reasoning_chunks = [event.thinking_text for event in events if event.type == "reasoning.delta"]
+        self.assertEqual(reasoning_chunks, ["Let me think. ", "Still thinking."])
+
 
 class CommandParsingTests(unittest.TestCase):
     def test_parse_command(self) -> None:
         self.assertEqual(parse_command("/thinking OFF"), ("thinking", "OFF"))
         self.assertEqual(parse_command("/model kimi_k2_5"), ("model", "kimi_k2_5"))
         self.assertEqual(parse_command("hello"), ("", "hello"))
+
+
+class FakeChatServiceForCli:
+    def stream_chat_turn(self, **_: object) -> Iterator[ChatStreamEvent]:
+        yield ChatStreamEvent(type="reasoning.delta", thinking_text="Analyzing the request. ")
+        yield ChatStreamEvent(type="reasoning.delta", thinking_text="Choosing next step.")
+        yield ChatStreamEvent(type="text.delta", text="Final answer.")
+        yield ChatStreamEvent(
+            type="completed",
+            final_answer="Final answer.",
+            summary=ConversationSummary(
+                id="conv-1",
+                title="Test",
+                visible_message_count=2,
+                active_model="fake-model",
+                thinking_enabled=True,
+                total_input_tokens=10,
+                total_output_tokens=12,
+                total_tokens=22,
+                updated_at=datetime.utcnow(),
+            ),
+        )
+
+
+class ChatCliRenderingTests(unittest.TestCase):
+    def test_send_chat_message_renders_thinking_and_answer_separately(self) -> None:
+        app = object.__new__(ChatCLIApp)
+        app.console = Console(record=True, force_terminal=False, color_system=None)
+        app.chat_service = FakeChatServiceForCli()
+        app.state = CliSessionState(
+            active_user_id="user-1",
+            active_conversation_id="conv-1",
+            active_model="fake-model",
+            thinking_enabled=True,
+        )
+
+        app._send_chat_message("hello")
+
+        output = app.console.export_text()
+        self.assertIn("thinking> Analyzing the request. Choosing next step.", output)
+        self.assertIn("assistant> Final answer.", output)
 
 
 if __name__ == "__main__":

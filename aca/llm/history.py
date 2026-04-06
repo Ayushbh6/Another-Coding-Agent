@@ -25,13 +25,27 @@ def project_messages_for_carryover(
             if mode is HistoryMode.DIALOGUE_ONLY:
                 if message.content:
                     projected.append(
-                        Message(role="assistant", content=message.content, metadata=dict(message.metadata))
+                        Message(
+                            role="assistant",
+                            content=message.content,
+                            reasoning=message.reasoning,
+                            reasoning_details=list(message.reasoning_details),
+                            metadata=dict(message.metadata),
+                        )
                     )
                 continue
 
             summary = _summarize_tool_calls(message)
             content = _append_summary(message.content, summary)
-            projected.append(Message(role="assistant", content=content, metadata=dict(message.metadata)))
+            projected.append(
+                Message(
+                    role="assistant",
+                    content=content,
+                    reasoning=message.reasoning,
+                    reasoning_details=list(message.reasoning_details),
+                    metadata=dict(message.metadata),
+                )
+            )
             continue
 
         projected.append(_copy_message(message))
@@ -46,6 +60,8 @@ def _copy_message(message: Message) -> Message:
         name=message.name,
         tool_call_id=message.tool_call_id,
         tool_calls=list(message.tool_calls),
+        reasoning=message.reasoning,
+        reasoning_details=list(message.reasoning_details),
         metadata=dict(message.metadata),
     )
 
@@ -64,4 +80,3 @@ def _summarize_tool_calls(message: Message) -> str:
 def _format_tool_summary(message: Message) -> str:
     tool_name = message.metadata.get("tool_name") or "tool"
     return f"[Prior {tool_name} result omitted from carryover.]"
-

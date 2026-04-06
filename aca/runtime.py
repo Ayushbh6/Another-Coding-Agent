@@ -7,7 +7,7 @@ from typing import Any
 
 from aca.llm.history import project_messages_for_carryover
 from aca.llm.providers.base import LLMProvider
-from aca.llm.types import HistoryMode, Message, ProviderEvent, ProviderRequest, RunResult, ToolCall
+from aca.llm.types import ContentPart, HistoryMode, Message, ProviderEvent, ProviderRequest, RunResult, ToolCall
 
 
 ToolHandler = Callable[..., Any]
@@ -26,14 +26,20 @@ class ToolExecutionRecord:
 @dataclass(slots=True)
 class AgentRunRequest:
     model: str
-    user_input: str
+    user_input: str | list[ContentPart] | None
     system_prompt: str | None = None
     carryover_messages: list[Message] = field(default_factory=list)
     tools: list[dict[str, Any]] = field(default_factory=list)
+    tool_choice: str | dict[str, Any] = "auto"
+    parallel_tool_calls: bool | None = None
+    response_format: dict[str, Any] | None = None
+    reasoning: dict[str, Any] | None = None
+    provider: dict[str, Any] | None = None
     history_mode: HistoryMode = HistoryMode.DIALOGUE_ONLY
     max_iterations: int = 10
     include_reasoning: bool = True
     provider_extra_body: dict[str, Any] = field(default_factory=dict)
+    append_user_message: bool = True
 
 
 @dataclass(slots=True)
@@ -62,7 +68,10 @@ class ToolLoopRuntime:
         if request.system_prompt:
             working_history.append(Message(role="system", content=request.system_prompt))
         working_history.extend(request.carryover_messages)
-        working_history.append(Message(role="user", content=request.user_input))
+        if request.append_user_message:
+            if request.user_input is None:
+                raise ValueError("user_input cannot be None when append_user_message is True.")
+            working_history.append(Message(role="user", content=request.user_input))
 
         tool_executions: list[ToolExecutionRecord] = []
         provider_runs: list[RunResult] = []
@@ -73,6 +82,11 @@ class ToolLoopRuntime:
                 model=request.model,
                 messages=working_history,
                 tools=request.tools,
+                tool_choice=self._resolve_tool_choice(request.tool_choice, iteration),
+                parallel_tool_calls=request.parallel_tool_calls,
+                response_format=request.response_format,
+                reasoning=request.reasoning,
+                provider=request.provider,
                 include_reasoning=request.include_reasoning,
                 extra_body=request.provider_extra_body,
             )
@@ -204,6 +218,11 @@ class ToolLoopRuntime:
         except json.JSONDecodeError:
             return {"raw_arguments": arguments}
         return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+    def _resolve_tool_choice(self, tool_choice: str | dict[str, Any], iteration: int) -> str | dict[str, Any]:
+        if iteration > 1 and tool_choice == "required":
+            return "auto"
+        return tool_choice
 
     def _build_result(
         self,

@@ -290,6 +290,8 @@ class ConversationService:
                     content_json={
                         "tool_calls": [self._tool_call_payload(tool_call) for tool_call in provider_run.tool_calls],
                         "reasoning": provider_run.reasoning,
+                        "reasoning_details": provider_run.reasoning_details,
+                        "structured_output": provider_run.structured_output,
                     },
                     provider_name=provider_run.provider,
                     model_name=model_name,
@@ -315,7 +317,11 @@ class ConversationService:
                     message_kind="assistant_final",
                     intent=intent,
                     content_text=provider_run.text or None,
-                    content_json={"reasoning": provider_run.reasoning},
+                    content_json={
+                        "reasoning": provider_run.reasoning,
+                        "reasoning_details": provider_run.reasoning_details,
+                        "structured_output": provider_run.structured_output,
+                    },
                     provider_name=provider_run.provider,
                     model_name=model_name,
                     response_id=provider_run.response_id,
@@ -472,7 +478,15 @@ class ConversationService:
                             arguments=str(raw_tool_call.get("arguments", "")),
                         )
                     )
-                messages.append(Message(role="assistant", content=row.content_text, tool_calls=tool_calls))
+                messages.append(
+                    Message(
+                        role="assistant",
+                        content=row.content_text,
+                        tool_calls=tool_calls,
+                        reasoning=payload.get("reasoning"),
+                        reasoning_details=payload.get("reasoning_details", []),
+                    )
+                )
                 continue
 
             if row.role == "tool":
@@ -486,7 +500,15 @@ class ConversationService:
                 )
                 continue
 
-            messages.append(Message(role=row.role, content=row.content_text))
+            payload = row.content_json or {}
+            messages.append(
+                Message(
+                    role=row.role,
+                    content=row.content_text,
+                    reasoning=payload.get("reasoning") if row.role == "assistant" else None,
+                    reasoning_details=payload.get("reasoning_details", []) if row.role == "assistant" else [],
+                )
+            )
 
         return messages
 

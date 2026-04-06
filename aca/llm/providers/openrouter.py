@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from collections.abc import Iterator
@@ -45,6 +46,7 @@ class OpenRouterProvider(LLMProvider):
         raw_chunks: list[dict[str, Any]] = []
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
+        reasoning_details: list[dict[str, Any]] = []
         tool_call_builders: dict[int, dict[str, Any]] = {}
         response_id: str | None = None
         finish_reason: str | None = None
@@ -76,6 +78,7 @@ class OpenRouterProvider(LLMProvider):
                     continue
 
                 reasoning_delta = self._extract_reasoning_delta(delta, raw_chunk)
+                reasoning_detail_deltas = self._extract_reasoning_details_delta(delta, raw_chunk)
                 if reasoning_delta:
                     reasoning_parts.append(reasoning_delta)
                     yield ProviderEvent(
@@ -83,6 +86,18 @@ class OpenRouterProvider(LLMProvider):
                         delta=reasoning_delta,
                         raw=raw_chunk,
                     )
+
+                if reasoning_detail_deltas:
+                    reasoning_details.extend(reasoning_detail_deltas)
+                    if not reasoning_delta:
+                        detail_text = self._extract_reasoning_text_from_details(reasoning_detail_deltas)
+                        if detail_text:
+                            reasoning_parts.append(detail_text)
+                            yield ProviderEvent(
+                                type="reasoning.delta",
+                                delta=detail_text,
+                                raw=raw_chunk,
+                            )
 
                 text_delta = self._extract_text_delta(delta)
                 if text_delta:
@@ -110,6 +125,8 @@ class OpenRouterProvider(LLMProvider):
             role="assistant",
             content=text or None,
             tool_calls=tool_calls,
+            reasoning=reasoning or None,
+            reasoning_details=list(reasoning_details),
         )
         latency_ms = (time.perf_counter() - started_at) * 1000
 
@@ -118,7 +135,9 @@ class OpenRouterProvider(LLMProvider):
             model=request.model,
             assistant_message=assistant_message,
             reasoning=reasoning,
+            reasoning_details=list(reasoning_details),
             text=text,
+            structured_output=self._parse_structured_output(text, request.response_format),
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=usage,
@@ -148,6 +167,12 @@ class OpenRouterProvider(LLMProvider):
             "tool_choice": request.tool_choice,
         }
 
+        if request.parallel_tool_calls is not None:
+            kwargs["parallel_tool_calls"] = request.parallel_tool_calls
+
+        if request.response_format is not None:
+            kwargs["response_format"] = request.response_format
+
         if request.temperature is not None:
             kwargs["temperature"] = request.temperature
 
@@ -155,8 +180,12 @@ class OpenRouterProvider(LLMProvider):
             kwargs["max_tokens"] = request.max_tokens
 
         extra_body = dict(request.extra_body)
-        if request.include_reasoning:
-            extra_body["include_reasoning"] = True
+        if request.provider is not None:
+            extra_body["provider"] = request.provider
+        if request.reasoning is not None:
+            extra_body["reasoning"] = request.reasoning
+        elif "reasoning" not in extra_body and "include_reasoning" not in extra_body:
+            extra_body["reasoning"] = {} if request.include_reasoning else {"exclude": True}
 
         if extra_body:
             kwargs["extra_body"] = extra_body
@@ -197,6 +226,24 @@ class OpenRouterProvider(LLMProvider):
                 return value
 
         return None
+
+    def _extract_reasoning_details_delta(self, delta: Any, raw_chunk: dict[str, Any]) -> list[dict[str, Any]]:
+        details = getattr(delta, "reasoning_details", None)
+        if details:
+            return [self._to_dict(item) for item in details if self._to_dict(item)]
+
+        choices = raw_chunk.get("choices") or []
+        if not choices:
+            return []
+
+        raw_delta = choices[0].get("delta") or {}
+        raw_details = raw_delta.get("reasoning_details") or []
+        return [detail for detail in raw_details if isinstance(detail, dict)]
+
+    def _extract_reasoning_text_from_details(self, details: list[dict[str, Any]]) -> str | None:
+        text_parts = [str(detail.get("text", "")) for detail in details if detail.get("text")]
+        combined = "".join(text_parts)
+        return combined or None
 
     def _extract_tool_call_deltas(
         self,
@@ -302,3 +349,16 @@ class OpenRouterProvider(LLMProvider):
         if hasattr(value, "model_dump"):
             return value.model_dump(exclude_none=True)
         return {}
+
+    def _parse_structured_output(self, text: str, response_format: dict[str, Any] | None) -> Any | None:
+        if not text or not response_format:
+            return None
+
+        response_type = response_format.get("type")
+        if response_type not in {"json_object", "json_schema"}:
+            return None
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return None
