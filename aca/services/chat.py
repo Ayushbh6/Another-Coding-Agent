@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterator
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from aca.llm.types import HistoryMode, Message
@@ -116,12 +116,13 @@ class ChatService:
 
     def get_or_create_active_conversation(self, user_id: str) -> ConversationSummary:
         with self._session_factory.begin() as session:
-            conversation = session.scalars(
+            latest_conversation = session.scalars(
                 select(Conversation)
                 .where(Conversation.user_id == user_id)
                 .order_by(Conversation.updated_at.desc(), Conversation.created_at.desc())
             ).first()
-            if conversation is None:
+
+            if latest_conversation is None:
                 conversation = Conversation(
                     id=self._new_id("conv"),
                     user_id=user_id,
@@ -139,6 +140,28 @@ class ChatService:
                 )
                 session.add(conversation)
                 session.flush()
+                return self._build_conversation_summary(session, conversation)
+
+            if latest_conversation.message_count == 0:
+                return self._build_conversation_summary(session, latest_conversation)
+
+            conversation = Conversation(
+                id=self._new_id("conv"),
+                user_id=user_id,
+                title="New chat",
+                status="active",
+                history_mode=HistoryMode.DIALOGUE_ONLY.value,
+                active_model=latest_conversation.active_model,
+                thinking_enabled=latest_conversation.thinking_enabled,
+                current_task_id=None,
+                message_count=0,
+                total_input_tokens=0,
+                total_output_tokens=0,
+                total_tokens=0,
+                metadata_json={},
+            )
+            session.add(conversation)
+            session.flush()
             return self._build_conversation_summary(session, conversation)
 
     def update_conversation_model(self, conversation_id: str, model: str) -> ConversationSummary:
@@ -210,6 +233,13 @@ class ChatService:
             for message in visible_messages:
                 message.visibility_status = CLEARED_MESSAGE_STATUS
             conversation.updated_at = datetime.utcnow()
+
+    def delete_conversation(self, conversation_id: str) -> None:
+        with self._session_factory.begin() as session:
+            conversation = session.get(Conversation, conversation_id)
+            if conversation is None:
+                raise ValueError(f"Conversation not found: {conversation_id}")
+            session.execute(delete(Conversation).where(Conversation.id == conversation_id))
 
     def stream_chat_turn(
         self,

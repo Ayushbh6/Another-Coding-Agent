@@ -77,6 +77,13 @@ def _seed_bootstrap_agents(session: Session) -> None:
             "owns_json": [],
             "reports_to_agent_id": "master",
         },
+        {
+            "id": "worker",
+            "name": "Worker",
+            "role": "worker",
+            "owns_json": [],
+            "reports_to_agent_id": "master",
+        },
     ]
 
     for seed in seeds:

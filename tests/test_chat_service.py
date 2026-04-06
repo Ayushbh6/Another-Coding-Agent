@@ -174,6 +174,68 @@ class ChatServiceTests(unittest.TestCase):
         conversations = self.chat_service.list_conversations(user.id)
         self.assertEqual([conversation.id for conversation in conversations], [second.id, first.id])
 
+    def test_get_or_create_active_conversation_reuses_latest_empty_conversation(self) -> None:
+        user = self.chat_service.initialize_user("Aparajit")
+        first = self.chat_service.create_conversation_with_settings(
+            user_id=user.id,
+            active_model="fake-model",
+            thinking_enabled=True,
+        )
+
+        reused = self.chat_service.get_or_create_active_conversation(user.id)
+
+        self.assertEqual(reused.id, first.id)
+        self.assertEqual(reused.active_model, "fake-model")
+        self.assertTrue(reused.thinking_enabled)
+
+    def test_get_or_create_active_conversation_creates_new_when_latest_has_messages(self) -> None:
+        user = self.chat_service.initialize_user("Aparajit")
+        first = self.chat_service.create_conversation_with_settings(
+            user_id=user.id,
+            active_model="fake-model",
+            thinking_enabled=True,
+        )
+        list(
+            self.chat_service.stream_chat_turn(
+                conversation_id=first.id,
+                user_input="Hello there",
+                model="fake-model",
+                thinking_enabled=True,
+            )
+        )
+
+        created = self.chat_service.get_or_create_active_conversation(user.id)
+
+        self.assertNotEqual(created.id, first.id)
+        self.assertEqual(created.active_model, "fake-model")
+        self.assertTrue(created.thinking_enabled)
+        self.assertEqual(created.visible_message_count, 0)
+
+    def test_delete_conversation_removes_conversation_and_messages(self) -> None:
+        user = self.chat_service.initialize_user("Aparajit")
+        conversation = self.chat_service.create_conversation_with_settings(
+            user_id=user.id,
+            active_model="fake-model",
+            thinking_enabled=False,
+        )
+        list(
+            self.chat_service.stream_chat_turn(
+                conversation_id=conversation.id,
+                user_input="Hello there",
+                model="fake-model",
+                thinking_enabled=False,
+            )
+        )
+
+        self.chat_service.delete_conversation(conversation.id)
+
+        with self.storage.session_factory() as session:
+            self.assertIsNone(session.get(Conversation, conversation.id))
+            remaining_messages = session.scalars(
+                select(ConversationMessage).where(ConversationMessage.conversation_id == conversation.id)
+            ).all()
+            self.assertEqual(remaining_messages, [])
+
     def test_model_and_thinking_changes_are_persisted(self) -> None:
         user = self.chat_service.initialize_user("Aparajit")
         conversation = self.chat_service.create_conversation_with_settings(

@@ -125,12 +125,16 @@ class Agent:
 
         remaining_turns = max(1, remaining_turns - tool_phase_result.iterations)
         final_phase_request = self._build_request(
-            user_input=None,
+            user_input=(
+                "Use the gathered tool results and return the final response now. "
+                "Follow the structured output schema exactly. "
+                "Return only the schema-compliant JSON object and do not call any more tools."
+            ),
             carryover_messages=tool_phase_result.working_history,
             extra_instructions=None,
             max_turns=remaining_turns,
             structured_output=resolved_structured_output,
-            append_user_message=False,
+            append_user_message=True,
             tools=[],
             tool_choice="auto",
             include_system_prompt=False,

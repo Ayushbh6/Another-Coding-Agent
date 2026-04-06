@@ -1,14 +1,38 @@
 from __future__ import annotations
 
 import json
-from typing import Protocol
+from typing import Any, Protocol
 
 from openai import OpenAI
 
 from aca.core_types import MasterClassification, TurnIntent
+from aca.json_utils import parse_json_object_loose
 from aca.llm.openrouter_client import create_openrouter_client
 from aca.llm.types import Message
 from aca.prompts import MASTER_CLASSIFICATION_PROMPT
+
+
+MASTER_CLASSIFICATION_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "master_classification",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "intent": {
+                    "type": "string",
+                    "enum": [intent.value for intent in TurnIntent],
+                },
+                "task_title": {"type": "string"},
+                "task_description": {"type": "string"},
+                "reasoning_summary": {"type": "string"},
+            },
+            "required": ["intent", "task_title", "task_description", "reasoning_summary"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 class MasterClassifier(Protocol):
@@ -39,17 +63,11 @@ class OpenRouterMasterClassifier:
             *[message.to_provider_dict() for message in messages],
             {"role": "user", "content": user_input},
         ]
-        try:
-            completion = self._client.chat.completions.create(
-                model=model,
-                messages=request_messages,
-                response_format={"type": "json_object"},
-            )
-        except Exception:
-            completion = self._client.chat.completions.create(
-                model=model,
-                messages=request_messages,
-            )
+        completion = self._client.chat.completions.create(
+            model=model,
+            messages=request_messages,
+            response_format=MASTER_CLASSIFICATION_RESPONSE_FORMAT,
+        )
 
         content = (completion.choices[0].message.content or "").strip()
         payload = _parse_json_object(content)
@@ -59,6 +77,14 @@ class OpenRouterMasterClassifier:
             intent = TurnIntent(intent_raw)
         except ValueError as exc:
             raise ValueError(f"Unsupported turn intent returned by classifier: {intent_raw}") from exc
+
+        if intent is TurnIntent.CHAT:
+            return MasterClassification(
+                intent=intent,
+                task_title="",
+                task_description="",
+                reasoning_summary="",
+            )
 
         return MasterClassification(
             intent=intent,
@@ -70,11 +96,8 @@ class OpenRouterMasterClassifier:
 
 def _parse_json_object(content: str) -> dict[str, object]:
     try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as exc:
+        parsed = parse_json_object_loose(content)
+    except ValueError as exc:
         raise ValueError(f"Master classifier did not return valid JSON: {content}") from exc
-
-    if not isinstance(parsed, dict):
-        raise ValueError("Master classifier returned a non-object JSON payload.")
 
     return parsed

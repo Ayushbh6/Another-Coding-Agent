@@ -4,15 +4,19 @@ from dataclasses import dataclass
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Confirm
 from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
+from aca.approval import ApprovalPolicy, ApprovalRequest
 from aca.config import get_allowed_openrouter_models, get_settings, resolve_openrouter_model
+from aca.master import OpenRouterMasterClassifier
 from aca.llm.providers import OpenRouterProvider
 from aca.prompts import COMMAND_HELP, WELCOME_BANNER, WELCOME_NAME_PROMPT, WELCOME_SUBTITLE, WELCOME_TITLE
 from aca.runtime import ToolLoopRuntime
-from aca.services.chat import ChatService, ChatStreamEvent
+from aca.services import TriageOrchestrator
+from aca.services.chat import ChatService
 from aca.storage import initialize_storage
 
 
@@ -22,6 +26,18 @@ class CliSessionState:
     active_conversation_id: str
     active_model: str
     thinking_enabled: bool = False
+
+
+class TerminalApprovalPolicy(ApprovalPolicy):
+    def __init__(self, console: Console) -> None:
+        self._console = console
+
+    def request(self, request: ApprovalRequest) -> bool:
+        self._console.print()
+        self._console.print("[bold yellow]approval[/bold yellow]> "
+                            f"{request.agent_id} wants to call [bold]{request.tool_name}[/bold]")
+        self._console.print(Text(request.preview, style="yellow"))
+        return Confirm.ask("[bold cyan]Allow this action?[/bold cyan]", console=self._console, default=False)
 
 
 def parse_command(raw_text: str) -> tuple[str, str]:
@@ -42,9 +58,16 @@ class ChatCLIApp:
         self.storage = initialize_storage(self.settings)
         self.provider = OpenRouterProvider(title="ACA-CLI")
         self.runtime = ToolLoopRuntime(provider=self.provider, tool_registry={})
+        self.classifier = OpenRouterMasterClassifier(title="ACA-CLI-Master-Classifier")
         self.chat_service = ChatService(
             session_factory=self.storage.session_factory,
             runtime=self.runtime,
+        )
+        self.triage = TriageOrchestrator(
+            session_factory=self.storage.session_factory,
+            provider=self.provider,
+            classifier=self.classifier,
+            approval_policy=TerminalApprovalPolicy(self.console),
         )
         self.state: CliSessionState | None = None
 
@@ -54,6 +77,7 @@ class ChatCLIApp:
             user = self._run_first_launch()
             conversation = self.chat_service.create_conversation(user.id)
         else:
+            self._print_welcome_banner(user.name)
             conversation = self.chat_service.get_or_create_active_conversation(user.id)
 
         self.state = CliSessionState(
@@ -91,13 +115,7 @@ class ChatCLIApp:
             self._send_chat_message(raw_text)
 
     def _run_first_launch(self):
-        self.console.print(
-            Panel.fit(
-                f"[bold magenta]{WELCOME_BANNER}[/bold magenta]\n\n[bright_cyan]{WELCOME_SUBTITLE}[/bright_cyan]",
-                title=f"[bold magenta]{WELCOME_TITLE}[/bold magenta]",
-                border_style="bright_magenta",
-            )
-        )
+        self._print_welcome_banner()
 
         name = ""
         while not name:
@@ -107,12 +125,34 @@ class ChatCLIApp:
         self.console.print(f"[bright_cyan]Identity locked:[/] [bold magenta]{user.name}[/bold magenta]")
         return user
 
+    def _print_welcome_banner(self, name: str | None = None) -> None:
+        subtitle = WELCOME_SUBTITLE
+        if name:
+            subtitle = f"Welcome back, [bold]{name}[/bold]! {subtitle}"
+
+        self.console.print(
+            Panel.fit(
+                f"[bold magenta]{WELCOME_BANNER}[/bold magenta]\n\n[bright_cyan]{subtitle}[/bright_cyan]",
+                title=f"[bold magenta]{WELCOME_TITLE}[/bold magenta]",
+                border_style="bright_magenta",
+            )
+        )
+
     def _handle_command(self, command: str, argument: str) -> bool:
         if self.state is None:
             raise RuntimeError("CLI session state is not initialized.")
 
         if command == "exit":
             return False
+        if command == "show":
+            self.console.print(
+                Panel.fit(
+                    COMMAND_HELP,
+                    title="[bold magenta]Commands[/bold magenta]",
+                    border_style="bright_cyan",
+                )
+            )
+            return True
         if command == "new":
             conversation = self.chat_service.create_conversation_with_settings(
                 user_id=self.state.active_user_id,
@@ -127,6 +167,9 @@ class ChatCLIApp:
             summary = self.chat_service.get_conversation_summary(self.state.active_conversation_id)
             self.console.print("[bold magenta]Current chat cleared.[/bold magenta]")
             self.console.print(self._token_status(summary.total_input_tokens, summary.total_output_tokens, summary.total_tokens))
+            return True
+        if command == "delete":
+            self._handle_delete_command()
             return True
         if command == "list":
             self._handle_list_command()
@@ -242,54 +285,166 @@ class ChatCLIApp:
         self.state.thinking_enabled = selected.thinking_enabled
         self.console.print(self._conversation_header(selected.title))
 
+    def _handle_delete_command(self) -> None:
+        if self.state is None:
+            return
+
+        confirmed = Confirm.ask(
+            "[bold red]Delete the current chat permanently?[/bold red]",
+            console=self.console,
+            default=False,
+        )
+        if not confirmed:
+            self.console.print("[bright_cyan]Delete cancelled.[/bright_cyan]")
+            return
+
+        self.chat_service.delete_conversation(self.state.active_conversation_id)
+        replacement = self.chat_service.create_conversation_with_settings(
+            user_id=self.state.active_user_id,
+            active_model=self.state.active_model,
+            thinking_enabled=self.state.thinking_enabled,
+        )
+        self.state.active_conversation_id = replacement.id
+        self.state.active_model = replacement.active_model or self.settings.default_openrouter_model
+        self.state.thinking_enabled = replacement.thinking_enabled
+        self.console.print("[bold magenta]Current chat deleted.[/bold magenta]")
+        self.console.print(self._conversation_header(replacement.title))
+
     def _send_chat_message(self, raw_text: str) -> None:
         if self.state is None:
             return
 
         spinner = self.console.status("[bold magenta]Neon relay warming up...[/bold magenta]", spinner="dots")
         spinner.start()
-        started_answer_stream = False
-        started_thinking_stream = False
+        active_streams: set[tuple[str, str]] = set()
         last_stream_type: str | None = None
+        stream_source = getattr(self, "triage", None)
+        use_legacy_stream = stream_source is None
 
         try:
-            for event in self.chat_service.stream_chat_turn(
-                conversation_id=self.state.active_conversation_id,
-                user_input=raw_text,
-                model=self.state.active_model,
-                thinking_enabled=self.state.thinking_enabled,
-            ):
-                if event.type == "reasoning.delta":
-                    if not started_thinking_stream:
+            event_iterator = (
+                self.chat_service.stream_chat_turn(
+                    conversation_id=self.state.active_conversation_id,
+                    user_input=raw_text,
+                    model=self.state.active_model,
+                    thinking_enabled=self.state.thinking_enabled,
+                )
+                if use_legacy_stream
+                else self.triage.stream_turn(
+                    conversation_id=self.state.active_conversation_id,
+                    user_input=raw_text,
+                    model=self.state.active_model,
+                    thinking_enabled=self.state.thinking_enabled,
+                )
+            )
+
+            for event in event_iterator:
+                if use_legacy_stream:
+                    if event.type == "reasoning.delta":
                         spinner.stop()
-                        self.console.print("[italic bright_black]thinking[/italic bright_black]> ", end="")
-                        started_thinking_stream = True
-                    self.console.print(
-                        Text(event.thinking_text or "", style="italic bright_black"),
-                        end="",
-                        soft_wrap=True,
-                        highlight=False,
-                    )
+                        if ("assistant", "reasoning") not in active_streams:
+                            self.console.print("[italic bright_black]thinking[/italic bright_black]> ", end="")
+                            active_streams.add(("assistant", "reasoning"))
+                        self.console.print(
+                            Text(event.thinking_text or "", style="italic bright_black"),
+                            end="",
+                            soft_wrap=True,
+                            highlight=False,
+                        )
+                        last_stream_type = "reasoning"
+                        continue
+
+                    if event.type == "text.delta":
+                        spinner.stop()
+                        if ("assistant", "text") not in active_streams:
+                            if last_stream_type == "reasoning":
+                                self.console.print()
+                            self.console.print("[bold magenta]assistant[/bold magenta]> ", end="")
+                            active_streams.add(("assistant", "text"))
+                        self.console.print(event.text or "", end="", soft_wrap=True, highlight=False)
+                        last_stream_type = "text"
+                        continue
+
+                    if event.type == "completed" and event.summary is not None:
+                        spinner.stop()
+                        if last_stream_type == "reasoning":
+                            self.console.print()
+                        if ("assistant", "text") not in active_streams:
+                            self.console.print("[bold magenta]assistant[/bold magenta]> ", end="")
+                            self.console.print(event.final_answer or "", end="", soft_wrap=True, highlight=False)
+                        self.console.print()
+                        self.console.print(
+                            self._token_status(
+                                event.summary.total_input_tokens,
+                                event.summary.total_output_tokens,
+                                event.summary.total_tokens,
+                            )
+                        )
+                        break
+                    continue
+
+                if event.type == "phase.started":
+                    spinner.stop()
+                    label = event.agent or "agent"
+                    phase = event.phase or "phase"
+                    phase_text = f"[{phase}]"
+                    if event.message:
+                        self._print_agent_line(label, f"{phase_text} {event.message}")
+                    else:
+                        self._print_agent_line(label, phase_text)
+                    active_streams.discard((label, "reasoning"))
+                    active_streams.discard((label, "text"))
+                    last_stream_type = None
+                    continue
+
+                if event.type == "reasoning.delta":
+                    spinner.stop()
+                    label = event.agent or "agent"
+                    if (label, "reasoning") not in active_streams:
+                        if last_stream_type == "text":
+                            self.console.print()
+                        self.console.print(f"[italic bright_black]{label} thinking[/italic bright_black]> ", end="")
+                        active_streams.add((label, "reasoning"))
+                    self.console.print(Text(event.thinking_text or "", style="italic bright_black"), end="", soft_wrap=True, highlight=False)
                     last_stream_type = "reasoning"
                     continue
 
                 if event.type == "text.delta":
-                    if not started_answer_stream:
-                        spinner.stop()
+                    spinner.stop()
+                    label = event.agent or "agent"
+                    if (label, "text") not in active_streams:
                         if last_stream_type == "reasoning":
                             self.console.print()
-                        self.console.print("[bold magenta]assistant[/bold magenta]> ", end="")
-                        started_answer_stream = True
+                        self.console.print(f"[bold magenta]{label}[/bold magenta]> ", end="")
+                        active_streams.add((label, "text"))
                     self.console.print(event.text or "", end="", soft_wrap=True, highlight=False)
                     last_stream_type = "text"
                     continue
 
+                if event.type == "worker.status":
+                    spinner.stop()
+                    if last_stream_type in {"reasoning", "text"}:
+                        self.console.print()
+                    self._print_agent_line(event.agent or "worker", event.message or "")
+                    last_stream_type = None
+                    continue
+
+                if event.type == "phase.completed":
+                    spinner.stop()
+                    if last_stream_type in {"reasoning", "text"}:
+                        self.console.print()
+                    if event.message:
+                        self._print_agent_line(event.agent or "agent", event.message)
+                    last_stream_type = None
+                    continue
+
                 if event.type == "completed" and event.summary is not None:
-                    if not started_answer_stream:
+                    spinner.stop()
+                    if last_stream_type == "reasoning":
+                        self.console.print()
+                    if last_stream_type != "text":
                         spinner.stop()
-                        if last_stream_type == "reasoning":
-                            self.console.print()
-                        self.console.print("[bold magenta]assistant[/bold magenta]> ", end="")
+                        self.console.print(f"[bold magenta]{event.agent or 'assistant'}[/bold magenta]> ", end="")
                         self.console.print(event.final_answer or "", end="", soft_wrap=True, highlight=False)
                     self.console.print()
                     self.console.print(
@@ -302,6 +457,14 @@ class ChatCLIApp:
                     break
         finally:
             spinner.stop()
+
+    def _print_agent_line(self, label: str, message: str) -> None:
+        line = Text()
+        line.append(label, style="bold magenta")
+        line.append("> ")
+        if message:
+            line.append(message)
+        self.console.print(line)
 
     def _resolve_model_choice(self, choice: str, options: list[tuple[str, str]]) -> str | None:
         cleaned = choice.strip()

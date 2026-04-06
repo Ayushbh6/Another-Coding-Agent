@@ -8,6 +8,8 @@ from typing import Any
 
 from openai import OpenAI
 
+from aca.json_utils import parse_json_object_loose
+
 from ..openrouter_client import create_openrouter_client
 from ..types import Message, ProviderEvent, ProviderRequest, RunResult, ToolCall, UsageStats
 from .base import LLMProvider
@@ -359,6 +361,6 @@ class OpenRouterProvider(LLMProvider):
             return None
 
         try:
-            return json.loads(text)
-        except json.JSONDecodeError:
+            return parse_json_object_loose(text)
+        except ValueError:
             return None

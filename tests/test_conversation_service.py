@@ -178,7 +178,7 @@ class ConversationServiceTests(unittest.TestCase):
 
         with self.storage.session_factory() as session:
             agents = session.scalars(select(Agent).order_by(Agent.id)).all()
-            self.assertEqual([agent.id for agent in agents], ["challenger", "codebase_mapper", "master"])
+            self.assertEqual([agent.id for agent in agents], ["challenger", "codebase_mapper", "master", "worker"])
 
         self.assertEqual(self.storage.chroma_collection.name, "aca-memory-test")
 

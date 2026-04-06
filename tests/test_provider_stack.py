@@ -157,6 +157,19 @@ class ProviderStackTests(unittest.TestCase):
 
         self.assertEqual(structured, {"title": "Spec Freeze", "owner": "master"})
 
+    def test_openrouter_parses_structured_output_when_fenced_json_is_returned(self) -> None:
+        provider = object.__new__(OpenRouterProvider)
+
+        structured = provider._parse_structured_output(
+            '```json\n{"title":"Spec Freeze","owner":"master"}\n```',
+            {
+                "type": "json_schema",
+                "json_schema": {"name": "plan", "strict": True, "schema": {"type": "object"}},
+            },
+        )
+
+        self.assertEqual(structured, {"title": "Spec Freeze", "owner": "master"})
+
     def test_runtime_preserves_reasoning_between_tool_iterations(self) -> None:
         provider = RuntimeReasoningCarryoverProvider()
         runtime = ToolLoopRuntime(provider=provider, tool_registry={"echo_tool": echo_tool})
