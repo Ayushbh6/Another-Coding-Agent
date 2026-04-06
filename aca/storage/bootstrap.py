@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import chromadb
-from sqlalchemy import Engine, event
+from sqlalchemy import Engine, event, inspect, text
 from sqlalchemy.engine import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -28,6 +28,7 @@ def initialize_storage(settings: Settings | None = None) -> StorageBootstrap:
     engine = create_engine(resolved.sqlite_url, future=True)
     _enable_sqlite_foreign_keys(engine)
     Base.metadata.create_all(engine)
+    _apply_lightweight_migrations(engine)
 
     session_factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
@@ -83,3 +84,54 @@ def _seed_bootstrap_agents(session: Session) -> None:
             continue
         session.add(Agent(**seed, status="active", metadata_json={}))
 
+
+def _apply_lightweight_migrations(engine: Engine) -> None:
+    inspector = inspect(engine)
+    conversation_columns = {column["name"] for column in inspector.get_columns("conversations")}
+    message_columns = {column["name"] for column in inspector.get_columns("conversation_messages")}
+
+    with engine.begin() as connection:
+        if "user_id" not in conversation_columns:
+            connection.execute(text("ALTER TABLE conversations ADD COLUMN user_id VARCHAR"))
+        if "active_model" not in conversation_columns:
+            connection.execute(text("ALTER TABLE conversations ADD COLUMN active_model VARCHAR"))
+        if "thinking_enabled" not in conversation_columns:
+            connection.execute(
+                text("ALTER TABLE conversations ADD COLUMN thinking_enabled BOOLEAN DEFAULT 0 NOT NULL")
+            )
+            connection.execute(
+                text(
+                    "UPDATE conversations "
+                    "SET thinking_enabled = 0 "
+                    "WHERE thinking_enabled IS NULL"
+                )
+            )
+
+        if "visibility_status" not in message_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE conversation_messages "
+                    "ADD COLUMN visibility_status VARCHAR DEFAULT 'visible' NOT NULL"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE conversation_messages "
+                    "SET visibility_status = 'visible' "
+                    "WHERE visibility_status IS NULL"
+                )
+            )
+        if "thinking_enabled" not in message_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE conversation_messages "
+                    "ADD COLUMN thinking_enabled BOOLEAN DEFAULT 0 NOT NULL"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE conversation_messages "
+                    "SET thinking_enabled = 0 "
+                    "WHERE thinking_enabled IS NULL"
+                )
+            )

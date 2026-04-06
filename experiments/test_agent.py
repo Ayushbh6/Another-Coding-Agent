@@ -1,9 +1,16 @@
 import json
-import requests
-from openai import OpenAI
-from typing import Any, Dict, List, Optional
-from dotenv import load_dotenv
 import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import requests
+from dotenv import load_dotenv
+from openai import OpenAI
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from aca.config import OPENROUTER_MODELS, get_settings
 
 load_dotenv()
 
@@ -12,9 +19,10 @@ load_dotenv()
 # ============================================================
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL_ID = "minimax/minimax-m2.7:nitro" #minimax/minimax-m2.7:nitro #z-ai/glm-5:nitro #google/gemma-4-31b-it:nitro
-
-#moonshotai/kimi-k2.5:nitro.
+MODEL_ID = get_settings().default_openrouter_model
+# Available shared registry entries:
+# OPENROUTER_MODELS["minimax_m2_7"]
+# OPENROUTER_MODELS["kimi_k2_5"]
 
 
 # ============================================================

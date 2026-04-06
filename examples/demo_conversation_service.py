@@ -8,14 +8,12 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from aca.config import get_settings
 from aca.llm.providers import OpenRouterProvider
 from aca.master import OpenRouterMasterClassifier
 from aca.runtime import ToolLoopRuntime
 from aca.services import ConversationService, ConversationTurnRequest
 from aca.storage import initialize_storage
-
-
-MODEL_ID = "minimax/minimax-m2.7:nitro"
 
 TOOLS = [
     {
@@ -50,6 +48,7 @@ def calculator(expression: str) -> str:
 
 def main() -> None:
     load_dotenv()
+    settings = get_settings()
     storage = initialize_storage()
     provider = OpenRouterProvider(title="ACA-Conversation-Service-Demo")
     service = ConversationService(
@@ -63,7 +62,8 @@ def main() -> None:
 
     result = service.handle_turn(
         ConversationTurnRequest(
-            model=MODEL_ID,
+            model=settings.default_openrouter_model,
+            classification_model=settings.default_classification_model,
             user_input="Calculate 18 * 7 using the calculator tool, then tell me the result.",
             tools=TOOLS,
         )

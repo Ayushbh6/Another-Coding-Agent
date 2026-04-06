@@ -8,29 +8,7 @@ from openai import OpenAI
 from aca.core_types import MasterClassification, TurnIntent
 from aca.llm.openrouter_client import create_openrouter_client
 from aca.llm.types import Message
-
-
-MASTER_CLASSIFICATION_PROMPT = """
-You are the Master classifier for a coding agent.
-
-Classify the current user turn into exactly one intent:
-- chat: casual or conversational, no meaningful repo work required
-- analyze: inspect or explain code/repo behavior, but do not change code
-- implement: make or plan to make code or file changes
-
-Return a strict JSON object with these keys:
-- intent
-- task_title
-- task_description
-- reasoning_summary
-
-Rules:
-- intent must be one of: chat, analyze, implement
-- task_title and task_description must be concise but useful
-- for chat, task_title and task_description may be empty strings
-- reasoning_summary must be brief and explain the classification
-- do not include markdown or any text outside the JSON object
-""".strip()
+from aca.prompts import MASTER_CLASSIFICATION_PROMPT
 
 
 class MasterClassifier(Protocol):

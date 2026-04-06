@@ -15,13 +15,28 @@ class Base(DeclarativeBase):
     pass
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+    conversations: Mapped[list["Conversation"]] = relationship(back_populates="user")
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     title: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     history_mode: Mapped[str] = mapped_column(String, nullable=False)
+    active_model: Mapped[str | None] = mapped_column(String, nullable=True)
+    thinking_enabled: Mapped[bool] = mapped_column(default=False, nullable=False)
     current_task_id: Mapped[str | None] = mapped_column(String, nullable=True)
     message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -32,6 +47,7 @@ class Conversation(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
+    user: Mapped[User | None] = relationship(back_populates="conversations")
     messages: Mapped[list["ConversationMessage"]] = relationship(back_populates="conversation")
     tasks: Mapped[list["Task"]] = relationship(back_populates="conversation")
 
@@ -55,6 +71,7 @@ class ConversationMessage(Base):
     tool_name: Mapped[str | None] = mapped_column(String, nullable=True)
     provider_name: Mapped[str | None] = mapped_column(String, nullable=True)
     model_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    thinking_enabled: Mapped[bool] = mapped_column(default=False, nullable=False)
     response_id: Mapped[str | None] = mapped_column(String, nullable=True)
     text_token_estimate: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -62,6 +79,7 @@ class ConversationMessage(Base):
     total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     reasoning_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     latency_ms: Mapped[float | None] = mapped_column(nullable=True)
+    visibility_status: Mapped[str] = mapped_column(String, nullable=False, default="visible")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
@@ -175,4 +193,3 @@ class MemoryEntry(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
-

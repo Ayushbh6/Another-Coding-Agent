@@ -8,12 +8,10 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from aca.config import get_settings
 from aca.llm.providers import OpenRouterProvider
 from aca.llm.types import HistoryMode
 from aca.runtime import AgentRunRequest, ToolLoopRuntime
-
-
-MODEL_ID = "minimax/minimax-m2.7:nitro"
 
 TOOLS = [
     {
@@ -83,6 +81,7 @@ def text_analyzer(text: str) -> str:
 
 def main() -> None:
     load_dotenv()
+    settings = get_settings()
 
     provider = OpenRouterProvider(title="ACA-Runtime-Demo")
     runtime = ToolLoopRuntime(
@@ -95,7 +94,7 @@ def main() -> None:
 
     result = runtime.run(
         AgentRunRequest(
-            model=MODEL_ID,
+            model=settings.default_openrouter_model,
             user_input="Calculate (500 - 125) * 8, then analyze the text 'The result is X' where X is your calculated value.",
             tools=TOOLS,
             history_mode=HistoryMode.DIALOGUE_ONLY,
