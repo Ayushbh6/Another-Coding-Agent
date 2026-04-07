@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from rich.console import Console
 from rich.console import Group
@@ -13,14 +14,14 @@ from rich.table import Table
 from rich.text import Text
 
 from aca.approval import ApprovalPolicy, ApprovalRequest
+from aca.cli_text import COMMAND_HELP, WELCOME_BANNER, WELCOME_NAME_PROMPT, WELCOME_SUBTITLE, WELCOME_TITLE
 from aca.config import get_allowed_openrouter_models, get_settings, resolve_openrouter_model
 from aca.llm.providers import OpenRouterProvider
 from aca.orchestration import NeonOrchestrator
 from aca.orchestration.state import NeonGuardrailError
-from aca.prompts import COMMAND_HELP, WELCOME_BANNER, WELCOME_NAME_PROMPT, WELCOME_SUBTITLE, WELCOME_TITLE
-from aca.runtime import ToolLoopRuntime
 from aca.services.chat import ChatService
 from aca.storage import initialize_storage
+from aca.tools import PathAccessDecision, PathAccessManager, PathAccessPromptRequest
 
 
 @dataclass(slots=True)
@@ -60,15 +61,18 @@ class ChatCLIApp:
         self.settings = get_settings()
         self.storage = initialize_storage(self.settings)
         self.provider = OpenRouterProvider(title="ACA-CLI")
-        self.runtime = ToolLoopRuntime(provider=self.provider, tool_registry={})
+        self.path_access_manager = PathAccessManager(
+            workspace_root=Path.cwd(),
+            prompt=self._prompt_path_access,
+        )
         self.chat_service = ChatService(
             session_factory=self.storage.session_factory,
-            runtime=self.runtime,
         )
         self.triage = NeonOrchestrator(
             session_factory=self.storage.session_factory,
             provider=self.provider,
             approval_policy=TerminalApprovalPolicy(self.console),
+            path_access_manager=self.path_access_manager,
         )
         self.state: CliSessionState | None = None
 
@@ -314,6 +318,9 @@ class ChatCLIApp:
     def _send_chat_message(self, raw_text: str) -> None:
         if self.state is None:
             return
+        path_access_manager = getattr(self, "path_access_manager", None)
+        if path_access_manager is not None:
+            path_access_manager.begin_turn(raw_text)
 
         spinner = self.console.status("[bold magenta]thinking...[/bold magenta]", spinner="dots")
         spinner.start()
@@ -367,67 +374,14 @@ class ChatCLIApp:
             self.console.print(Group(header, Markdown(content)))
 
         try:
-            triage = getattr(self, "triage", None)
-            use_chat_service = triage is None
-            if use_chat_service:
-                event_iterator = self.chat_service.stream_chat_turn(
-                    conversation_id=self.state.active_conversation_id,
-                    user_input=raw_text,
-                    model=self.state.active_model,
-                    thinking_enabled=self.state.thinking_enabled,
-                )
-            else:
-                event_iterator = triage.stream_turn(
-                    conversation_id=self.state.active_conversation_id,
-                    user_input=raw_text,
-                    model=self.state.active_model,
-                    thinking_enabled=self.state.thinking_enabled,
-                )
+            event_iterator = self.triage.stream_turn(
+                conversation_id=self.state.active_conversation_id,
+                user_input=raw_text,
+                model=self.state.active_model,
+                thinking_enabled=self.state.thinking_enabled,
+            )
 
             for event in event_iterator:
-                if use_chat_service:
-                    if event.type == "reasoning.delta":
-                        spinner.stop()
-                        stop_live_markdown()
-                        if ("assistant", "reasoning") not in active_streams:
-                            self.console.print("[italic bright_black]thinking[/italic bright_black]> ", end="")
-                            active_streams.add(("assistant", "reasoning"))
-                        self.console.print(
-                            Text(event.thinking_text or "", style="italic bright_black"),
-                            end="",
-                            soft_wrap=True,
-                            highlight=False,
-                        )
-                        last_stream_type = "reasoning"
-                        continue
-
-                    if event.type == "text.delta":
-                        spinner.stop()
-                        if ("assistant", "text") not in active_streams:
-                            if last_stream_type == "reasoning":
-                                self.console.print()
-                            active_streams.add(("assistant", "text"))
-                        render_markdown_stream("assistant", event.text or "")
-                        last_stream_type = "text"
-                        continue
-
-                    if event.type == "completed" and event.summary is not None:
-                        spinner.stop()
-                        stop_live_markdown()
-                        if last_stream_type == "reasoning":
-                            self.console.print()
-                        if ("assistant", "text") not in active_streams:
-                            print_markdown_once("assistant", event.final_answer or "")
-                        self.console.print(
-                            self._token_status(
-                                event.summary.total_input_tokens,
-                                event.summary.total_output_tokens,
-                                event.summary.total_tokens,
-                            )
-                        )
-                        break
-                    continue
-
                 if event.type == "phase.started":
                     label = event.agent or "agent"
                     # Suppress internal routing noise; just keep the spinner alive
@@ -458,7 +412,8 @@ class ChatCLIApp:
                         if last_stream_type == "reasoning":
                             self.console.print()
                         active_streams.add((label, "text"))
-                    render_markdown_stream(label, event.text or "")
+                    for segment in self._iter_render_segments(event.text or ""):
+                        render_markdown_stream(label, segment)
                     last_stream_type = "text"
                     continue
 
@@ -528,6 +483,52 @@ class ChatCLIApp:
             line.append("  ", style="")
             line.append(message, style="dim")
         self.console.print(line)
+
+    def _prompt_path_access(self, request: PathAccessPromptRequest) -> PathAccessDecision:
+        self.console.print()
+        label = "sensitive path access" if request.sensitive else "ignored path access"
+        self.console.print(f"[bold yellow]{label}[/bold yellow]> {request.relative_path}")
+        self.console.print(Text(request.absolute_path, style="yellow"))
+        if request.sensitive:
+            self.console.print("[bold red]This path may contain secrets or private credentials.[/bold red]")
+        choice = Prompt.ask(
+            "[bold cyan]Allow read access?[/bold cyan]",
+            choices=["yes", "no", "always"],
+            default="no",
+            console=self.console,
+        )
+        if choice == "yes":
+            return "allow_once"
+        if choice == "always":
+            return "allow_session"
+        return "deny"
+
+    @staticmethod
+    def _iter_render_segments(text: str) -> list[str]:
+        if not text:
+            return []
+
+        segments: list[str] = []
+        current: list[str] = []
+        non_whitespace_run = 0
+
+        for char in text:
+            current.append(char)
+            if char.isspace():
+                segments.append("".join(current))
+                current = []
+                non_whitespace_run = 0
+                continue
+
+            non_whitespace_run += 1
+            if non_whitespace_run >= 12:
+                segments.append("".join(current))
+                current = []
+                non_whitespace_run = 0
+
+        if current:
+            segments.append("".join(current))
+        return segments
 
     def _resolve_model_choice(self, choice: str, options: list[tuple[str, str]]) -> str | None:
         cleaned = choice.strip()

@@ -8,7 +8,7 @@ from pathlib import Path
 from aca.approval import AllowAllApprovalPolicy, DenyAllApprovalPolicy
 from aca.config import Settings
 from aca.storage import initialize_storage
-from aca.workspace_tools import ToolPermissionError, WorkspaceToolContext, WorkspaceToolRegistry
+from aca.tools import PathAccessManager, ToolPermissionError, WorkspaceToolContext, WorkspaceToolRegistry
 
 
 class WorkspaceToolRegistryTests(unittest.TestCase):
@@ -74,11 +74,35 @@ class WorkspaceToolRegistryTests(unittest.TestCase):
         )
 
         result = json.loads(registry.write_file("notes.txt", "created"))
-        patched = json.loads(registry.apply_patch("notes.txt", "created", "updated"))
+        patched = json.loads(
+            registry.edit_file(
+                "notes.txt",
+                [{"op": "replace_exact", "old_text": "created", "new_text": "updated"}],
+            )
+        )
 
         self.assertEqual(result["path"], "notes.txt")
-        self.assertEqual(patched["replacements"], 1)
+        self.assertEqual(len(patched["operations_applied"]), 1)
         self.assertEqual((self.root / "notes.txt").read_text(encoding="utf-8"), "updated")
+
+    def test_write_file_refuses_overwrite_by_default(self) -> None:
+        registry = WorkspaceToolRegistry(
+            WorkspaceToolContext(
+                root=self.root,
+                session_factory=self.storage.session_factory,
+                task_id=None,
+                agent_id="worker",
+                approval_policy=AllowAllApprovalPolicy(),
+            )
+        )
+
+        registry.write_file("notes.txt", "first")
+        with self.assertRaises(ValueError):
+            registry.write_file("notes.txt", "second")
+
+        overwritten = json.loads(registry.write_file("notes.txt", "second", overwrite=True))
+        self.assertTrue(overwritten["overwrote_existing"])
+        self.assertEqual((self.root / "notes.txt").read_text(encoding="utf-8"), "second")
 
     def test_list_files_ignores_generated_and_gitignored_paths(self) -> None:
         registry = WorkspaceToolRegistry(
@@ -187,6 +211,131 @@ class WorkspaceToolRegistryTests(unittest.TestCase):
         self.assertEqual(result["matches"][0]["end_line"], 3)
         self.assertIn("needle here", result["matches"][0]["snippet"])
 
+    def test_search_code_supports_regex_and_symbol_modes(self) -> None:
+        (self.root / "src" / "symbols.py").write_text(
+            "class NeonOrchestrator:\n    pass\n\ndef helper():\n    return 1\n",
+            encoding="utf-8",
+        )
+        registry = WorkspaceToolRegistry(
+            WorkspaceToolContext(
+                root=self.root,
+                session_factory=self.storage.session_factory,
+                task_id=None,
+                agent_id="worker",
+                approval_policy=AllowAllApprovalPolicy(),
+            )
+        )
+
+        regex_result = json.loads(registry.search_code(r"helper\(\)", path="src", mode="regex"))
+        symbol_result = json.loads(registry.search_code("NeonOrchestrator", path="src", mode="symbol"))
+
+        self.assertEqual(regex_result["count"], 1)
+        self.assertEqual(symbol_result["count"], 1)
+        self.assertEqual(symbol_result["matches"][0]["line"], 1)
+
+    def test_search_code_rejects_invalid_regex(self) -> None:
+        registry = WorkspaceToolRegistry(
+            WorkspaceToolContext(
+                root=self.root,
+                session_factory=self.storage.session_factory,
+                task_id=None,
+                agent_id="worker",
+                approval_policy=AllowAllApprovalPolicy(),
+            )
+        )
+
+        with self.assertRaises(ValueError):
+            registry.search_code("(", mode="regex")
+
+    def test_edit_file_supports_insert_and_replace_range(self) -> None:
+        (self.root / "src" / "edit_me.py").write_text(
+            "alpha\nbeta\ngamma\n",
+            encoding="utf-8",
+        )
+        registry = WorkspaceToolRegistry(
+            WorkspaceToolContext(
+                root=self.root,
+                session_factory=self.storage.session_factory,
+                task_id=None,
+                agent_id="worker",
+                approval_policy=AllowAllApprovalPolicy(),
+            )
+        )
+
+        registry.edit_file(
+            "src/edit_me.py",
+            [
+                {"op": "insert_before", "anchor": "beta", "new_text": "before-beta\n"},
+                {"op": "replace_range", "start_line": 3, "end_line": 3, "new_text": "BETTER\n"},
+                {"op": "insert_after", "anchor": "gamma", "new_text": "\nafter-gamma"},
+            ],
+        )
+
+        text = (self.root / "src" / "edit_me.py").read_text(encoding="utf-8")
+        self.assertIn("before-beta", text)
+        self.assertIn("BETTER", text)
+        self.assertIn("after-gamma", text)
+
+    def test_edit_file_rejects_ambiguous_or_missing_targets(self) -> None:
+        (self.root / "src" / "ambiguous.py").write_text("same\nsame\n", encoding="utf-8")
+        registry = WorkspaceToolRegistry(
+            WorkspaceToolContext(
+                root=self.root,
+                session_factory=self.storage.session_factory,
+                task_id=None,
+                agent_id="worker",
+                approval_policy=AllowAllApprovalPolicy(),
+            )
+        )
+
+        with self.assertRaises(ValueError):
+            registry.edit_file("src/ambiguous.py", [{"op": "replace_exact", "old_text": "missing", "new_text": "x"}])
+        with self.assertRaises(ValueError):
+            registry.edit_file("src/ambiguous.py", [{"op": "insert_before", "anchor": "missing", "new_text": "x"}])
+
+    def test_file_ops_supports_mkdir_copy_move_and_delete(self) -> None:
+        (self.root / "src" / "copy_me.py").write_text("print('copy')\n", encoding="utf-8")
+        registry = WorkspaceToolRegistry(
+            WorkspaceToolContext(
+                root=self.root,
+                session_factory=self.storage.session_factory,
+                task_id=None,
+                agent_id="worker",
+                approval_policy=AllowAllApprovalPolicy(),
+            )
+        )
+
+        result = json.loads(
+            registry.file_ops(
+                [
+                    {"op": "mkdir", "path": "generated"},
+                    {"op": "copy", "path": "src/copy_me.py", "destination": "generated/copied.py"},
+                    {"op": "move", "path": "generated/copied.py", "destination": "generated/moved.py"},
+                    {"op": "delete", "path": "generated/moved.py"},
+                ]
+            )
+        )
+
+        self.assertEqual(len(result["operations_applied"]), 4)
+        self.assertTrue((self.root / "generated").exists())
+        self.assertFalse((self.root / "generated" / "moved.py").exists())
+
+    def test_run_command_reports_risk_and_output(self) -> None:
+        registry = WorkspaceToolRegistry(
+            WorkspaceToolContext(
+                root=self.root,
+                session_factory=self.storage.session_factory,
+                task_id=None,
+                agent_id="worker",
+                approval_policy=AllowAllApprovalPolicy(),
+            )
+        )
+
+        result = json.loads(registry.run_command("pwd", cwd="."))
+        self.assertEqual(result["risk"], "read_only")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertTrue(result["stdout"])
+
     def test_list_files_supports_max_depth(self) -> None:
         (self.root / "src" / "nested").mkdir(parents=True, exist_ok=True)
         (self.root / "src" / "nested" / "deep.py").write_text("print('deep')\n", encoding="utf-8")
@@ -223,3 +372,107 @@ class WorkspaceToolRegistryTests(unittest.TestCase):
         self.assertEqual(result["start_line"], 1)
         self.assertEqual(result["end_line"], 200)
         self.assertTrue(result["truncated"])
+
+    def test_exact_path_override_allows_ignored_file_for_one_turn(self) -> None:
+        decisions = ["allow_once"]
+        manager = PathAccessManager(
+            workspace_root=self.root,
+            prompt=lambda request: decisions.pop(0),
+        )
+        manager.begin_turn("Please read `ignored_dir/hidden.py`")
+        registry = WorkspaceToolRegistry(
+            WorkspaceToolContext(
+                root=self.root,
+                session_factory=self.storage.session_factory,
+                task_id=None,
+                agent_id="worker",
+                approval_policy=AllowAllApprovalPolicy(),
+                path_access_manager=manager,
+            )
+        )
+
+        allowed = json.loads(registry.read_file("ignored_dir/hidden.py"))
+        self.assertEqual(allowed["path"], "ignored_dir/hidden.py")
+
+        manager.begin_turn("nothing explicit now")
+        with self.assertRaises(ValueError):
+            registry.read_file("ignored_dir/hidden.py")
+
+    def test_exact_path_override_can_persist_for_session(self) -> None:
+        manager = PathAccessManager(
+            workspace_root=self.root,
+            prompt=lambda request: "allow_session",
+        )
+        manager.begin_turn("Please read `ignored_dir/hidden.py`")
+        registry = WorkspaceToolRegistry(
+            WorkspaceToolContext(
+                root=self.root,
+                session_factory=self.storage.session_factory,
+                task_id=None,
+                agent_id="worker",
+                approval_policy=AllowAllApprovalPolicy(),
+                path_access_manager=manager,
+            )
+        )
+
+        registry.read_file("ignored_dir/hidden.py")
+        manager.begin_turn("different turn")
+        allowed_again = json.loads(registry.read_file("ignored_dir/hidden.py"))
+        self.assertEqual(allowed_again["path"], "ignored_dir/hidden.py")
+
+        fresh_manager = PathAccessManager(workspace_root=self.root, prompt=lambda request: "deny")
+        fresh_manager.begin_turn("different turn")
+        fresh_registry = WorkspaceToolRegistry(
+            WorkspaceToolContext(
+                root=self.root,
+                session_factory=self.storage.session_factory,
+                task_id=None,
+                agent_id="worker",
+                approval_policy=AllowAllApprovalPolicy(),
+                path_access_manager=fresh_manager,
+            )
+        )
+        with self.assertRaises(ValueError):
+            fresh_registry.read_file("ignored_dir/hidden.py")
+
+    def test_directory_or_glob_override_is_rejected(self) -> None:
+        manager = PathAccessManager(
+            workspace_root=self.root,
+            prompt=lambda request: "allow_once",
+        )
+        manager.begin_turn("Please read ignored_dir/*")
+        registry = WorkspaceToolRegistry(
+            WorkspaceToolContext(
+                root=self.root,
+                session_factory=self.storage.session_factory,
+                task_id=None,
+                agent_id="worker",
+                approval_policy=AllowAllApprovalPolicy(),
+                path_access_manager=manager,
+            )
+        )
+
+        with self.assertRaises(ValueError):
+            registry.read_file("ignored_dir/hidden.py")
+
+    def test_sensitive_file_triggers_separate_prompt_path(self) -> None:
+        seen: list[bool] = []
+        manager = PathAccessManager(
+            workspace_root=self.root,
+            prompt=lambda request: seen.append(request.sensitive) or "allow_once",
+        )
+        manager.begin_turn("Please read `.env`")
+        registry = WorkspaceToolRegistry(
+            WorkspaceToolContext(
+                root=self.root,
+                session_factory=self.storage.session_factory,
+                task_id=None,
+                agent_id="worker",
+                approval_policy=AllowAllApprovalPolicy(),
+                path_access_manager=manager,
+            )
+        )
+
+        allowed = json.loads(registry.read_file(".env"))
+        self.assertEqual(allowed["path"], ".env")
+        self.assertEqual(seen, [True])

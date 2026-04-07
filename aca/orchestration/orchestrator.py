@@ -5,7 +5,6 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
@@ -16,70 +15,66 @@ from sqlalchemy.orm import Session, sessionmaker
 from aca.agent import AgentRunResult, create_agent
 from aca.approval import ApprovalPolicy
 from aca.core_types import TurnIntent
-from aca.llm.types import HistoryMode, Message, ToolCall
+from aca.llm.types import HistoryMode, Message
 from aca.llm.providers.base import LLMProvider
-from aca.orchestration.prompts import ANALYZE_WORKER_PROMPT, NEON_PROMPT
+from aca.orchestration.prompts import ANALYZE_WORKER_PROMPT, IMPLEMENT_WORKER_PROMPT, NEON_PROMPT
+from aca.orchestration.guardrails import GuardrailMixin
+from aca.orchestration.history import HistoryMixin
+from aca.orchestration.persistence import PersistenceMixin
 from aca.orchestration.repo_summary import RepoSummaryService
 from aca.orchestration.state import (
     ACTOR_ANALYZE_WORKER,
+    ACTOR_IMPLEMENT_WORKER,
     ACTOR_NEON,
     ANALYZE_DELEGATED_ROUTE,
     ANALYZE_SIMPLE_ROUTE,
     ARCHIVE_DELAY,
+    IMPLEMENT_ROUTE,
     PHASE_DELEGATED_WAIT,
     PHASE_ORIENTATION,
     PHASE_SYNTHESIZE,
     PHASE_TASK_CREATED,
     PHASE_TODO_READY,
-    STEERING_IMPLEMENT_DISABLED,
     STEERING_ORIENTATION_DELEGATED,
     STEERING_ORIENTATION_SIMPLE,
-    STEERING_PLAN_REQUIRED,
-    STEERING_PRETASK_LIMIT_REACHED,
-    STEERING_READ_FINDINGS,
+    STEERING_IMPLEMENT_WORKER_CONSOLIDATING,
     STEERING_SPAWN_WORKER_REQUIRED,
     STEERING_TASK_REQUIRED_NOW,
     STEERING_TODO_ITEM_REQUIRED,
-    STEERING_TODO_REQUIRED,
-    STEERING_TODO_REVIEW,
     STEERING_WORKER_CONSOLIDATING,
     AnalyzeWorkerState,
+    ImplementWorkerState,
     NeonGuardrailError,
     NeonRunState,
     OrchestratedStreamEvent,
 )
 from aca.orchestration.steering import steering_message
 from aca.orchestration.tools import OrchestrationToolRegistry
-from aca.orchestration.todo import todo_in_progress, todo_is_complete
-from aca.services.chat import ConversationSummary
 from aca.storage.models import (
-    Action,
-    AgentMessage,
-    Checkpoint,
     Conversation,
-    ConversationMessage,
     MemoryEntry,
     Task,
     User,
 )
 from aca.task_workspace import TaskWorkspaceManager, parse_task_markdown, parse_todo_markdown
-from aca.token_utils import estimate_json_tokens, estimate_text_tokens
-from aca.workspace_tools import ToolPermissionError, WorkspaceToolContext, WorkspaceToolRegistry
+from aca.tools import PathAccessManager, ToolPermissionError, WorkspaceToolContext, WorkspaceToolRegistry
 
 
-class NeonOrchestrator:
+class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
     def __init__(
         self,
         *,
         session_factory: sessionmaker[Session],
         provider: LLMProvider,
         approval_policy: ApprovalPolicy | None = None,
+        path_access_manager: PathAccessManager | None = None,
         workspace_root: str | os.PathLike[str] | None = None,
         archive_root: str | os.PathLike[str] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._provider = provider
         self._approval_policy = approval_policy
+        self._path_access_manager = path_access_manager
         self._workspace_root = Path(workspace_root or os.getcwd()).resolve()
         self._archive_root = Path(archive_root or (Path.home() / ".aca" / "task-archives")).expanduser().resolve()
         self._workspace_manager = TaskWorkspaceManager(self._workspace_root, self._archive_root)
@@ -290,7 +285,8 @@ class NeonOrchestrator:
                 session_factory=self._session_factory,
                 task_id=state.task_id,
                 agent_id="master",
-                approval_policy=None,
+                approval_policy=self._approval_policy,
+                path_access_manager=self._path_access_manager,
             )
             read_registry = WorkspaceToolRegistry(context)
             tool_registry = OrchestrationToolRegistry(
@@ -401,7 +397,7 @@ class NeonOrchestrator:
                         task_id=state.task_id,
                         message=self._summarize_tool_result(tool_name, event.delta),
                     )
-                    if tool_name == "spawn_analyze_worker" and state.worker_requested and not state.worker_spawned:
+                    if tool_name in {"spawn_analyze_worker", "spawn_implement_worker"} and state.worker_requested and not state.worker_spawned:
                         handoff_requested = True
                         break
                     if tool_name == "write_task_artifact" and steering_code in {
@@ -419,17 +415,24 @@ class NeonOrchestrator:
                 close = getattr(stream, "close", None)
                 if callable(close):
                     close()
-                worker_payload = yield from self._stream_delegated_analyze_worker(
-                    conversation_id=conversation_id,
-                    state=state,
-                )
+                if state.route == IMPLEMENT_ROUTE:
+                    worker_payload = yield from self._stream_delegated_implement_worker(
+                        conversation_id=conversation_id,
+                        state=state,
+                    )
+                else:
+                    worker_payload = yield from self._stream_delegated_analyze_worker(
+                        conversation_id=conversation_id,
+                        state=state,
+                    )
                 state.worker_requested = False
                 state.worker_spawned = worker_payload.get("status") == "completed"
                 state.phase = PHASE_SYNTHESIZE
                 state.worker_summary = str(worker_payload.get("summary", ""))
+                artifact_name = "output.md" if state.route == IMPLEMENT_ROUTE else "findings.md"
                 correction_message = (
                     f"{self._run_instructions(state)}\n\n"
-                    "The delegated worker phase has finished. Read findings.md and completion.json now and synthesize the final answer."
+                    f"The delegated worker phase has finished. Read {artifact_name} and completion.json now and synthesize the final answer."
                 )
                 # Use the actual tool-call history accumulated during this cycle.
                 # _delegated_progress_messages produces synthetic role="tool" messages with no
@@ -472,15 +475,6 @@ class NeonOrchestrator:
 
         raise NeonGuardrailError(self._guardrail_feedback_code(state) or STEERING_TASK_REQUIRED_NOW)
 
-    def _should_stream_live_text(self, state: NeonRunState) -> bool:
-        if state.task_id is None and state.pretask_read_calls == 0:
-            return True
-        if state.phase == PHASE_SYNTHESIZE:
-            return True
-        if state.route == ANALYZE_SIMPLE_ROUTE and state.todo_written and todo_is_complete(state.todo_items):
-            return True
-        return False
-
     def _steering_code_from_result(self, raw_result: str | None) -> str | None:
         if not raw_result:
             return None
@@ -493,94 +487,10 @@ class NeonOrchestrator:
         steering_code = payload.get("steering_code")
         return str(steering_code) if steering_code else None
 
-    def _should_restart_after_tool_result(self, state: NeonRunState, tool_name: str, steering_code: str | None) -> bool:
-        if tool_name in {"list_files", "read_file", "search_code"}:
-            return steering_code in {
-                STEERING_PRETASK_LIMIT_REACHED,
-                STEERING_ORIENTATION_SIMPLE,
-                STEERING_ORIENTATION_DELEGATED,
-            }
-        if tool_name == "write_task_artifact":
-            return steering_code in {
-                STEERING_TODO_ITEM_REQUIRED,
-                STEERING_SPAWN_WORKER_REQUIRED,
-            }
-        return False
-
-    def _phase_restart_instruction(self, state: NeonRunState, steering_code: str | None) -> str:
-        base = self._run_instructions(state)
-        if steering_code == STEERING_PRETASK_LIMIT_REACHED:
-            return (
-                f"{base}\n\n"
-                "The scout pass is complete. Do not call list_files, read_file, or search_code now. "
-                "Your next step must be either a direct chat answer or write_task_artifact(task.md)."
-            )
-        if steering_code == STEERING_ORIENTATION_SIMPLE:
-            return (
-                f"{base}\n\n"
-                "Orientation is complete. Do not call repo-read tools now. "
-                "Your next step must be write_task_artifact(todo.md)."
-            )
-        if steering_code == STEERING_ORIENTATION_DELEGATED:
-            return (
-                f"{base}\n\n"
-                "Orientation is complete. Do not call repo-read tools now. "
-                "Your next step must be write_task_artifact(plan.md), then write_task_artifact(todo.md)."
-            )
-        if steering_code == STEERING_PLAN_REQUIRED:
-            return f"{base}\n\nYour next step must be write_task_artifact(plan.md)."
-        if steering_code == STEERING_TODO_REQUIRED:
-            return f"{base}\n\nYour next step must be write_task_artifact(todo.md)."
-        if steering_code == STEERING_TODO_ITEM_REQUIRED:
-            return f"{base}\n\nYour next step must be read_todo_state or start_todo_item for the first pending item."
-        if steering_code == STEERING_SPAWN_WORKER_REQUIRED:
-            return f"{base}\n\nYour next step must be spawn_analyze_worker."
-        if steering_code == STEERING_READ_FINDINGS:
-            return f"{base}\n\nYour next step must be read_task_artifact(findings.md) and read_task_artifact(completion.json)."
-        return base
-
-    def _preferred_analysis_route(self, state: NeonRunState) -> str:
-        lowered = state.user_input.lower()
-        broad_markers = ("scan", "codebase", "architecture", "repo", "repository", "system", "how it works")
-        return ANALYZE_DELEGATED_ROUTE if any(marker in lowered for marker in broad_markers) else ANALYZE_SIMPLE_ROUTE
-
-    def _guardrail_recovery_instruction(self, state: NeonRunState, feedback_code: str, failure_count: int) -> str:
-        base = self._run_instructions(state)
-        if feedback_code in {STEERING_PRETASK_LIMIT_REACHED, STEERING_TASK_REQUIRED_NOW}:
-            preferred_route = self._preferred_analysis_route(state)
-            if failure_count <= 1:
-                return (
-                    f"{base}\n\n"
-                    "Do not answer yet. The scout pass is done. "
-                    "Your next action must be write_task_artifact(task.md)."
-                )
-            return (
-                f"{base}\n\n"
-                "You must call write_task_artifact next. Do not answer in plain text and do not call repo-read tools.\n"
-                "Use this task.md frontmatter shape exactly:\n"
-                f"---\n"
-                f"task_id: {state.planned_task_id}\n"
-                "intent: analyze\n"
-                f"route: {preferred_route}\n"
-                "title: <short task title>\n"
-                "---\n"
-                "<normalized task statement>"
-            )
-        if feedback_code == STEERING_PLAN_REQUIRED:
-            return f"{base}\n\nYour next action must be write_task_artifact(plan.md). Do not read artifacts or answer yet."
-        if feedback_code == STEERING_TODO_REQUIRED:
-            return f"{base}\n\nYour next action must be write_task_artifact(todo.md). Do not answer yet."
-        if feedback_code == STEERING_TODO_ITEM_REQUIRED:
-            return f"{base}\n\nYour next action must be start_todo_item for the first pending item."
-        if feedback_code == STEERING_SPAWN_WORKER_REQUIRED:
-            return f"{base}\n\nYour next action must be spawn_analyze_worker. Do not answer yet."
-        if feedback_code == STEERING_READ_FINDINGS:
-            return f"{base}\n\nYour next actions must be read_task_artifact(findings.md) and read_task_artifact(completion.json), then synthesize."
-        return f"{base}\n\nDo not abandon the task. Correct the route or next action now using the allowed tools."
-
     def _ensure_task_created(self, state: NeonRunState, parsed: Any) -> str:
         if state.task_id is not None:
             return state.task_id
+        intent = state.intent or TurnIntent.ANALYZE
 
         with self._session_factory.begin() as session:
             conversation = session.get(Conversation, state.conversation_id)
@@ -590,7 +500,7 @@ class NeonOrchestrator:
                 id=state.planned_task_id,
                 conversation_id=conversation.id,
                 parent_task_id=None,
-                intent=TurnIntent.ANALYZE.value,
+                intent=intent.value,
                 title=parsed.title,
                 description=parsed.normalized_task,
                 status="in_progress",
@@ -619,7 +529,7 @@ class NeonOrchestrator:
                 agent_id="master",
                 action_type="task_created",
                 target=task.id,
-                input_json={"route": parsed.route, "intent": TurnIntent.ANALYZE.value},
+                input_json={"route": parsed.route, "intent": intent.value},
                 result_json={"status": task.status, "phase": task.phase},
                 status="success",
             )
@@ -630,12 +540,34 @@ class NeonOrchestrator:
                 phase="NEW_TASK",
                 checkpoint_kind="task_created",
                 summary="Task workspace created from task.md.",
-                state_json={"route": parsed.route, "intent": TurnIntent.ANALYZE.value},
+                state_json={"route": parsed.route, "intent": intent.value},
             )
 
         state.task_id = state.planned_task_id
         self._workspace_manager.ensure_task_dir(state.task_id)
         return state.task_id
+
+    def _hydrate_worker_state(self, worker_state: AnalyzeWorkerState | ImplementWorkerState) -> None:
+        with self._session_factory() as session:
+            task = session.get(Task, worker_state.task_id)
+            if task is None:
+                return
+            metadata = dict(task.metadata_json or {})
+            worker_state.orientation_read_calls = int(metadata.get("orientation_read_calls", 0) or 0)
+            artifact_paths = metadata.get("artifact_paths", {})
+            if isinstance(artifact_paths, dict):
+                worker_state.artifact_paths = {
+                    str(name): str(path)
+                    for name, path in artifact_paths.items()
+                    if isinstance(name, str) and isinstance(path, str)
+                }
+            todo_state = dict(metadata.get("todo_state", {}))
+            raw_items = todo_state.get("items", [])
+            if isinstance(raw_items, list):
+                worker_state.todo_items = [dict(item) for item in raw_items if isinstance(item, dict)]
+            current_todo_id = todo_state.get("current_todo_id")
+            if isinstance(current_todo_id, str) and current_todo_id:
+                worker_state.current_todo_id = current_todo_id
 
     def _stream_delegated_analyze_worker(
         self,
@@ -647,32 +579,15 @@ class NeonOrchestrator:
             raise RuntimeError("Delegated analyze worker requires an active task.")
 
         worker_state = AnalyzeWorkerState(task_id=state.task_id)
-        with self._session_factory() as session:
-            task = session.get(Task, state.task_id)
-            if task is not None:
-                metadata = dict(task.metadata_json or {})
-                worker_state.orientation_read_calls = int(metadata.get("orientation_read_calls", 0) or 0)
-                artifact_paths = metadata.get("artifact_paths", {})
-                if isinstance(artifact_paths, dict):
-                    worker_state.artifact_paths = {
-                        str(name): str(path)
-                        for name, path in artifact_paths.items()
-                        if isinstance(name, str) and isinstance(path, str)
-                    }
-                todo_state = dict(metadata.get("todo_state", {}))
-                raw_items = todo_state.get("items", [])
-                if isinstance(raw_items, list):
-                    worker_state.todo_items = [dict(item) for item in raw_items if isinstance(item, dict)]
-                current_todo_id = todo_state.get("current_todo_id")
-                if isinstance(current_todo_id, str) and current_todo_id:
-                    worker_state.current_todo_id = current_todo_id
+        self._hydrate_worker_state(worker_state)
 
         context = WorkspaceToolContext(
             root=self._workspace_root,
             session_factory=self._session_factory,
             task_id=state.task_id,
             agent_id="worker",
-            approval_policy=None,
+            approval_policy=self._approval_policy,
+            path_access_manager=self._path_access_manager,
         )
         read_registry = WorkspaceToolRegistry(context)
         registry = OrchestrationToolRegistry(
@@ -705,10 +620,10 @@ class NeonOrchestrator:
 
         carryover_messages: list[Message] = []
         extra_instructions = (
-            f"{self._user_identity_instruction(state)}\n"
-            "Read task.md, plan.md, and todo.md first. "
-            "Execute the todo one item at a time. "
-            "Finish by writing findings.md."
+            f"{self._user_identity_instruction(state)}\n\n"
+            f"## TASK TITLE\n{state.task_title}\n\n"
+            f"## TASK STATEMENT\n{state.task_statement}\n\n"
+            "Anchor on the delegated task artifacts and produce a dense, factual findings.md."
         )
         result: AgentRunResult | None = None
         for _attempt in range(3):
@@ -716,7 +631,9 @@ class NeonOrchestrator:
                 final_result: AgentRunResult | None = None
                 pending_text_chunks: list[str] = []
                 for event in worker.stream(
-                    "Read the delegated analysis task artifacts, inspect the repository, write findings.md, and stop.",
+                    "Read task.md, plan.md, and todo.md. "
+                    "Follow todo.md sequentially. "
+                    "Write a dense, factual findings.md, then stop.",
                     carryover_messages=carryover_messages,
                     extra_instructions=extra_instructions,
                 ):
@@ -881,6 +798,236 @@ class NeonOrchestrator:
         )
         return payload
 
+    def _stream_delegated_implement_worker(
+        self,
+        *,
+        conversation_id: str,
+        state: NeonRunState,
+    ) -> Iterator[dict[str, Any] | OrchestratedStreamEvent]:
+        if state.task_id is None:
+            raise RuntimeError("Delegated implement worker requires an active task.")
+
+        worker_state = ImplementWorkerState(task_id=state.task_id)
+        self._hydrate_worker_state(worker_state)
+
+        context = WorkspaceToolContext(
+            root=self._workspace_root,
+            session_factory=self._session_factory,
+            task_id=state.task_id,
+            agent_id="worker",
+            approval_policy=self._approval_policy,
+            path_access_manager=self._path_access_manager,
+            auto_approve_tools=frozenset({"write_file", "edit_file", "file_ops"}),
+        )
+        read_registry = WorkspaceToolRegistry(context)
+        registry = OrchestrationToolRegistry(
+            orchestrator=self,
+            actor=ACTOR_IMPLEMENT_WORKER,
+            route=IMPLEMENT_ROUTE,
+            state=worker_state,
+            workspace_manager=self._workspace_manager,
+            read_registry=read_registry,
+        )
+        worker = create_agent(
+            name="ImplementWorker",
+            model=state.model,
+            instructions=IMPLEMENT_WORKER_PROMPT,
+            provider=self._provider,
+            tools=registry.schemas(),
+            tool_registry=registry.handlers(),
+            max_turns=24,
+            reasoning_enabled=state.thinking_enabled,
+            history_mode=HistoryMode.DIALOGUE_ONLY,
+        )
+        yield OrchestratedStreamEvent(
+            type="phase.started",
+            agent="worker",
+            phase="delegated_implement",
+            conversation_id=conversation_id,
+            task_id=state.task_id,
+            message="Delegated implement worker started.",
+        )
+
+        carryover_messages: list[Message] = []
+        extra_instructions = (
+            f"{self._user_identity_instruction(state)}\n\n"
+            f"## TASK TITLE\n{state.task_title}\n\n"
+            f"## TASK STATEMENT\n{state.task_statement}\n\n"
+            "Anchor on the delegated task artifacts and produce a concise, factual output.md."
+        )
+        result: AgentRunResult | None = None
+        for _attempt in range(3):
+            try:
+                final_result: AgentRunResult | None = None
+                pending_text_chunks: list[str] = []
+                for event in worker.stream(
+                    "Read task.md, plan.md, and todo.md. "
+                    "Follow todo.md sequentially. "
+                    "Write a concise, factual output.md, then stop.",
+                    carryover_messages=carryover_messages,
+                    extra_instructions=extra_instructions,
+                ):
+                    if event.type == "text.delta":
+                        pending_text_chunks.append(event.delta or "")
+                        continue
+
+                    if event.type == "reasoning.delta":
+                        yield OrchestratedStreamEvent(
+                            type="reasoning.delta",
+                            agent="worker",
+                            phase="delegated_implement",
+                            conversation_id=conversation_id,
+                            task_id=state.task_id,
+                            thinking_text=event.delta,
+                        )
+                        continue
+
+                    if event.type == "usage.update":
+                        state.turn_input_tokens += event.metadata.get("input_tokens", 0)
+                        state.turn_output_tokens += event.metadata.get("output_tokens", 0)
+                        state.turn_total_tokens += event.metadata.get("total_tokens", 0)
+                        continue
+
+                    if event.type == "runtime.tool_result":
+                        if pending_text_chunks:
+                            for chunk in pending_text_chunks:
+                                yield OrchestratedStreamEvent(
+                                    type="text.delta",
+                                    agent="worker",
+                                    phase="delegated_implement",
+                                    conversation_id=conversation_id,
+                                    task_id=state.task_id,
+                                    text=chunk,
+                                )
+                            pending_text_chunks = []
+                        tool_name = event.tool_call.name if event.tool_call is not None else "unknown"
+                        yield OrchestratedStreamEvent(
+                            type="worker.status",
+                            agent="worker",
+                            phase="delegated_implement",
+                            conversation_id=conversation_id,
+                            task_id=state.task_id,
+                            message=self._summarize_tool_result(tool_name, event.delta),
+                        )
+                        continue
+
+                    if event.type == "run.completed" and isinstance(event.result, AgentRunResult):
+                        final_result = event.result
+
+                if final_result is None:
+                    raise RuntimeError("Implement worker stream did not complete.")
+                if worker_state.output_written and pending_text_chunks:
+                    for chunk in pending_text_chunks:
+                        yield OrchestratedStreamEvent(
+                            type="text.delta",
+                            agent="worker",
+                            phase="delegated_implement",
+                            conversation_id=conversation_id,
+                            task_id=state.task_id,
+                            text=chunk,
+                        )
+                result = final_result
+            except ToolPermissionError as exc:
+                payload = {"status": "failed", "summary": str(exc), "output_path": None}
+                self._write_completion_artifact(state, status="failed", worker_status="failed", worker_summary=str(exc))
+                yield OrchestratedStreamEvent(
+                    type="phase.completed",
+                    agent="worker",
+                    phase="delegated_implement",
+                    conversation_id=conversation_id,
+                    task_id=state.task_id,
+                    message=str(exc),
+                    payload=payload,
+                )
+                return payload
+
+            if worker_state.output_written:
+                break
+            if result is None:
+                break
+            carryover_messages = result.working_history
+            extra_instructions = (
+                f"{self._user_identity_instruction(state)}\n"
+                "Use what you already changed. "
+                "Do not continue broad exploration. "
+                "Consolidate the execution into output.md now."
+            )
+            yield OrchestratedStreamEvent(
+                type="worker.status",
+                agent="worker",
+                phase="delegated_implement",
+                conversation_id=conversation_id,
+                task_id=state.task_id,
+                message=steering_message(STEERING_IMPLEMENT_WORKER_CONSOLIDATING),
+            )
+
+        if result is None or not worker_state.output_written:
+            summary = "Implement worker finished without writing output.md."
+            self._write_completion_artifact(state, status="failed", worker_status="failed", worker_summary=summary)
+            payload = {"status": "failed", "summary": summary, "output_path": None}
+            yield OrchestratedStreamEvent(
+                type="phase.completed",
+                agent="worker",
+                phase="delegated_implement",
+                conversation_id=conversation_id,
+                task_id=state.task_id,
+                message=steering_message(STEERING_IMPLEMENT_WORKER_CONSOLIDATING),
+                payload=payload,
+            )
+            return payload
+
+        self._persist_agent_message(
+            state.task_id,
+            "master",
+            "worker",
+            "assignment",
+            "delegated_implement",
+            "Complete the delegated implementation and write output.md.",
+        )
+        self._persist_agent_message(
+            state.task_id,
+            "worker",
+            "master",
+            "completion",
+            "delegated_output",
+            worker_state.output_path or "output.md",
+        )
+        self._write_completion_artifact(
+            state,
+            status="worker_completed",
+            worker_status="completed",
+            worker_summary=self._final_text_payload(result),
+        )
+        with self._session_factory.begin() as session:
+            task = session.get(Task, state.task_id)
+            if task is not None:
+                task.phase = "REVIEW"
+                self._write_checkpoint(
+                    session,
+                    task_id=task.id,
+                    agent_id="worker",
+                    phase="REVIEW",
+                    checkpoint_kind="worker_completed",
+                    summary="Delegated implement worker completed.",
+                    state_json={"output_path": worker_state.output_path},
+                )
+
+        payload = {
+            "status": "completed",
+            "summary": "Implement worker completed.",
+            "output_path": worker_state.output_path,
+        }
+        yield OrchestratedStreamEvent(
+            type="phase.completed",
+            agent="worker",
+            phase="delegated_implement",
+            conversation_id=conversation_id,
+            task_id=state.task_id,
+            message="Implement worker completed.",
+            payload=payload,
+        )
+        return payload
+
     def _write_completion_artifact(
         self,
         state: NeonRunState,
@@ -946,182 +1093,6 @@ class NeonOrchestrator:
         )
         return todo_items
 
-    def _persist_todo_state(
-        self,
-        state: NeonRunState | AnalyzeWorkerState,
-        *,
-        agent_id: str = "master",
-        action_type: str,
-        todo_id: str | None,
-        note: str | None,
-        todo_items: list[dict[str, Any]] | None = None,
-        extra: dict[str, Any] | None = None,
-    ) -> None:
-        if state.task_id is None:
-            return
-        items = [dict(item) for item in (todo_items if todo_items is not None else state.todo_items)]
-        state.todo_items = items
-        todo_path = self._workspace_manager.write_todo_state(state.task_id, items)
-        relative_path = todo_path.relative_to(self._workspace_root).as_posix()
-        state.artifact_paths["todo.md"] = relative_path
-
-        with self._session_factory.begin() as session:
-            task = session.get(Task, state.task_id)
-            if task is not None:
-                metadata = dict(task.metadata_json or {})
-                artifact_paths = dict(metadata.get("artifact_paths", {}))
-                artifact_paths["todo.md"] = relative_path
-                metadata["artifact_paths"] = artifact_paths
-                metadata["phase"] = state.phase
-                metadata["orientation_read_calls"] = state.orientation_read_calls
-                metadata["todo_state"] = {"items": items, "current_todo_id": state.current_todo_id}
-                task.metadata_json = metadata
-                self._log_action(
-                    session,
-                    task_id=state.task_id,
-                    agent_id=agent_id,
-                    action_type=action_type,
-                    target=todo_id or relative_path,
-                    input_json={"todo_id": todo_id, "note": note or "", **(extra or {})},
-                    result_json={"path": relative_path, "count": len(items), "current_todo_id": state.current_todo_id},
-                    status="success",
-                )
-                checkpoint_kind = {
-                    "todo_initialized": "todo_ready",
-                    "todo_item_started": "todo_execution_started",
-                    "todo_item_completed": "todo_item_completed",
-                    "todo_item_skipped": "todo_item_skipped",
-                    "todo_revised": "todo_revised",
-                }.get(action_type, "todo_updated")
-                self._write_checkpoint(
-                    session,
-                    task_id=state.task_id,
-                    agent_id=agent_id,
-                    phase=state.phase.upper(),
-                    checkpoint_kind=checkpoint_kind,
-                    summary=note or action_type.replace("_", " "),
-                    state_json={"todo_id": todo_id, "current_todo_id": state.current_todo_id, "items": items, **(extra or {})},
-                )
-
-    def _steering_instructions(self, state: NeonRunState) -> str:
-        base = (
-            f"If you take a non-chat route, use task_id `{state.planned_task_id}` in task.md frontmatter exactly. "
-            "Do not invent another task id."
-        )
-        if not state.task_written:
-            return (
-                f"{base}\n"
-                "You may use get_repo_summary and up to 2 pre-task repo reads before you must either answer as chat or write task.md."
-            )
-        if state.route == ANALYZE_SIMPLE_ROUTE:
-            if not state.todo_written:
-                return f"{base}\nTask created. You may now do up to 2 orientation reads, then write todo.md."
-            if todo_is_complete(state.todo_items):
-                return f"{base}\nTodo execution is complete. Synthesize the final answer now."
-            current = todo_in_progress(state.todo_items)
-            if current is None:
-                return f"{base}\nTodo is ready. Start one todo item before continuing the analysis."
-            return f"{base}\nCurrent todo item in progress: {current['title']}. Continue or finish it before moving on."
-        if state.route == ANALYZE_DELEGATED_ROUTE:
-            if not state.plan_written:
-                return f"{base}\nTask created. You may now do up to 2 orientation reads, then write plan.md."
-            if not state.todo_written:
-                return f"{base}\nPlan is ready. Write todo.md next."
-            if not state.worker_spawned:
-                return f"{base}\nTodo is ready. Your next action must be spawn_analyze_worker."
-            return f"{base}\nThe worker has finished. Read findings.md and completion.json, then synthesize the final answer."
-        return f"{base}\nIf the user asked for code changes, implementation mode is disabled. Answer directly without creating a task."
-
-    def _user_identity_instruction(self, state: NeonRunState) -> str:
-        if state.user_name:
-            return f"You are currently assisting the user named {state.user_name}."
-        return "You are currently assisting the active CLI user for this conversation."
-
-    def _run_instructions(self, state: NeonRunState) -> str:
-        return f"{self._user_identity_instruction(state)}\n\n{self._steering_instructions(state)}"
-
-    def _guardrail_feedback_code(self, state: NeonRunState) -> str | None:
-        if state.task_id is None:
-            if state.pretask_read_calls >= 2:
-                return STEERING_PRETASK_LIMIT_REACHED
-            if state.pretask_read_calls > 0:
-                return STEERING_TASK_REQUIRED_NOW
-            return None
-
-        if state.route == ANALYZE_SIMPLE_ROUTE:
-            if not state.todo_written:
-                return STEERING_TODO_REQUIRED
-            if todo_in_progress(state.todo_items) is None and not todo_is_complete(state.todo_items):
-                return STEERING_TODO_ITEM_REQUIRED
-            if not todo_is_complete(state.todo_items):
-                return STEERING_TODO_REVIEW
-            return None
-
-        if state.route == ANALYZE_DELEGATED_ROUTE:
-            if not state.plan_written:
-                return STEERING_PLAN_REQUIRED
-            if not state.todo_written:
-                return STEERING_TODO_REQUIRED
-            if not state.worker_spawned:
-                return STEERING_SPAWN_WORKER_REQUIRED
-            return None
-
-        return STEERING_IMPLEMENT_DISABLED
-
-    def _delegated_progress_messages(self, state: NeonRunState) -> list[Message]:
-        messages: list[Message] = []
-        for artifact_name in ("task.md", "plan.md", "todo.md"):
-            if artifact_name in state.artifact_paths:
-                messages.append(
-                    Message(
-                        role="tool",
-                        content=json.dumps({"artifact_name": artifact_name, "path": state.artifact_paths[artifact_name]}),
-                        metadata={"tool_name": "write_task_artifact"},
-                    )
-                )
-        messages.append(
-            Message(
-                role="tool",
-                content=json.dumps({"status": "scheduled", "summary": "Analyze worker scheduled."}),
-                metadata={"tool_name": "spawn_analyze_worker"},
-            )
-        )
-        if "findings.md" in state.artifact_paths:
-            messages.append(
-                Message(
-                    role="tool",
-                    content=json.dumps({"artifact_name": "findings.md", "path": state.artifact_paths["findings.md"]}),
-                    metadata={"tool_name": "read_task_artifact"},
-                )
-            )
-        if "completion.json" in state.artifact_paths:
-            messages.append(
-                Message(
-                    role="tool",
-                    content=json.dumps({"artifact_name": "completion.json", "path": state.artifact_paths["completion.json"]}),
-                    metadata={"tool_name": "read_task_artifact"},
-                )
-            )
-        return messages
-
-    def _record_artifact_write(self, *, task_id: str, agent_id: str, artifact_name: str, relative_path: str) -> None:
-        self._record_runtime_action(
-            task_id=task_id,
-            agent_id=agent_id,
-            action_type="task_artifact_written",
-            target=relative_path,
-            input_json={"artifact_name": artifact_name},
-            result_json={"path": relative_path},
-        )
-        with self._session_factory.begin() as session:
-            task = session.get(Task, task_id)
-            if task is not None:
-                metadata = dict(task.metadata_json or {})
-                artifact_paths = dict(metadata.get("artifact_paths", {}))
-                artifact_paths[artifact_name] = relative_path
-                metadata["artifact_paths"] = artifact_paths
-                task.metadata_json = metadata
-
     def _update_task_metadata_after_task_rewrite(self, state: NeonRunState, parsed: Any) -> None:
         if state.task_id is None:
             return
@@ -1137,31 +1108,6 @@ class NeonOrchestrator:
             metadata["phase"] = state.phase
             metadata["todo_state"] = {"items": [], "current_todo_id": None}
             task.metadata_json = metadata
-
-    def _record_runtime_action(
-        self,
-        *,
-        task_id: str | None,
-        agent_id: str,
-        action_type: str,
-        target: str | None,
-        input_json: dict[str, Any],
-        result_json: dict[str, Any],
-        status: str = "success",
-        error_text: str | None = None,
-    ) -> None:
-        with self._session_factory.begin() as session:
-            self._log_action(
-                session,
-                task_id=task_id,
-                agent_id=agent_id,
-                action_type=action_type,
-                target=target,
-                input_json=input_json,
-                result_json=result_json,
-                status=status,
-                error_text=error_text,
-            )
 
     def _web_search(self, *, query: str, limit: int) -> dict[str, Any]:
         encoded = urllib.parse.urlencode({"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
@@ -1256,8 +1202,8 @@ class NeonOrchestrator:
         if tool_name in {"start_todo_item", "complete_todo_item", "skip_todo_item", "revise_todo"} and payload is not None:
             return str(payload.get("summary", tool_name))
 
-        if tool_name == "spawn_analyze_worker" and payload is not None:
-            return str(payload.get("summary", "Analyze worker scheduled."))
+        if tool_name in {"spawn_analyze_worker", "spawn_implement_worker"} and payload is not None:
+            return str(payload.get("summary", "Worker scheduled."))
 
         if tool_name == "write_repo_doc" and payload is not None:
             return f"updated {payload.get('doc_name', 'repo doc')}"
@@ -1285,253 +1231,3 @@ class NeonOrchestrator:
             state.turn_input_tokens += u.input_tokens or 0
             state.turn_output_tokens += u.output_tokens or 0
             state.turn_total_tokens += u.total_tokens or 0
-
-    def _build_summary(self, session: Session, conversation: Conversation) -> ConversationSummary:
-        message_aggregates = session.execute(
-            select(
-                func.count(ConversationMessage.id),
-                func.coalesce(func.sum(ConversationMessage.input_tokens), 0),
-                func.coalesce(func.sum(ConversationMessage.output_tokens), 0),
-                func.coalesce(func.sum(ConversationMessage.total_tokens), 0),
-            ).where(ConversationMessage.conversation_id == conversation.id)
-        ).one()
-        return ConversationSummary(
-            id=conversation.id,
-            title=conversation.title,
-            visible_message_count=int(message_aggregates[0] or 0),
-            active_model=conversation.active_model,
-            thinking_enabled=conversation.thinking_enabled,
-            total_input_tokens=int(message_aggregates[1] or 0),
-            total_output_tokens=int(message_aggregates[2] or 0),
-            total_tokens=int(message_aggregates[3] or 0),
-            updated_at=conversation.updated_at,
-        )
-
-    def _load_full_history(self, session: Session, conversation_id: str) -> list[Message]:
-        rows = session.scalars(
-            select(ConversationMessage)
-            .where(ConversationMessage.conversation_id == conversation_id)
-            .order_by(ConversationMessage.sequence_no)
-        ).all()
-        messages: list[Message] = []
-        for row in rows:
-            if row.role == "assistant" and row.message_kind == "assistant_tool_request":
-                tool_calls = []
-                payload = row.content_json or {}
-                for raw_tool_call in payload.get("tool_calls", []):
-                    tool_calls.append(
-                        ToolCall(
-                            id=str(raw_tool_call.get("id", "")),
-                            name=str(raw_tool_call.get("name", "")),
-                            arguments=str(raw_tool_call.get("arguments", "")),
-                        )
-                    )
-                messages.append(
-                    Message(
-                        role="assistant",
-                        content=row.content_text,
-                        tool_calls=tool_calls,
-                        reasoning=payload.get("reasoning"),
-                        reasoning_details=payload.get("reasoning_details", []),
-                    )
-                )
-                continue
-
-            if row.role == "tool":
-                messages.append(
-                    Message(
-                        role="tool",
-                        content=row.content_text,
-                        tool_call_id=row.tool_call_id,
-                        metadata={"tool_name": row.tool_name} if row.tool_name else {},
-                    )
-                )
-                continue
-
-            payload = row.content_json or {}
-            messages.append(
-                Message(
-                    role=row.role,
-                    content=row.content_text,
-                    reasoning=payload.get("reasoning") if row.role == "assistant" else None,
-                    reasoning_details=payload.get("reasoning_details", []) if row.role == "assistant" else [],
-                )
-            )
-        return messages
-
-    def _insert_conversation_message(
-        self,
-        session: Session,
-        *,
-        conversation: Conversation,
-        role: str,
-        message_kind: str,
-        intent: TurnIntent | None = None,
-        content_text: str | None = None,
-        content_json: dict[str, Any] | None = None,
-        tool_call_id: str | None = None,
-        tool_name: str | None = None,
-        provider_name: str | None = None,
-        model_name: str | None = None,
-        response_id: str | None = None,
-        input_tokens: int | None = None,
-        output_tokens: int | None = None,
-        total_tokens: int | None = None,
-        reasoning_tokens: int | None = None,
-        latency_ms: float | None = None,
-        metadata_json: dict[str, Any] | None = None,
-    ) -> ConversationMessage:
-        sequence_no = self._next_message_sequence(session, conversation.id)
-        text_token_estimate = estimate_text_tokens(content_text, model=model_name)
-        if content_json:
-            text_token_estimate += estimate_json_tokens(content_json, model=model_name)
-
-        resolved_input = input_tokens if input_tokens is not None else (text_token_estimate if role in {"user", "tool"} else 0)
-        resolved_output = output_tokens if output_tokens is not None else (text_token_estimate if role == "assistant" else 0)
-        resolved_total = total_tokens if total_tokens is not None else resolved_input + resolved_output
-        resolved_reasoning = reasoning_tokens if reasoning_tokens is not None else 0
-
-        row = ConversationMessage(
-            id=self._new_id("msg"),
-            conversation_id=conversation.id,
-            sequence_no=sequence_no,
-            role=role,
-            message_kind=message_kind,
-            intent=intent.value if intent is not None else None,
-            content_text=content_text,
-            content_json=content_json,
-            tool_call_id=tool_call_id,
-            tool_name=tool_name,
-            provider_name=provider_name,
-            model_name=model_name,
-            response_id=response_id,
-            text_token_estimate=text_token_estimate,
-            input_tokens=resolved_input,
-            output_tokens=resolved_output,
-            total_tokens=resolved_total,
-            reasoning_tokens=resolved_reasoning,
-            latency_ms=latency_ms,
-            metadata_json=metadata_json or {},
-        )
-        session.add(row)
-
-        now = datetime.utcnow()
-        conversation.message_count += 1
-        conversation.total_input_tokens += resolved_input
-        conversation.total_output_tokens += resolved_output
-        conversation.total_tokens += resolved_total
-        conversation.last_message_at = now
-        conversation.updated_at = now
-        return row
-
-    def _log_action(
-        self,
-        session: Session,
-        *,
-        task_id: str | None,
-        agent_id: str,
-        action_type: str,
-        target: str | None,
-        input_json: dict[str, Any],
-        result_json: dict[str, Any],
-        status: str,
-        error_text: str | None = None,
-    ) -> None:
-        session.add(
-            Action(
-                id=self._new_id("act"),
-                task_id=task_id,
-                agent_id=agent_id,
-                action_type=action_type,
-                target=target,
-                input_json=input_json,
-                result_json=result_json,
-                status=status,
-                completed_at=datetime.utcnow(),
-                error_text=error_text,
-                metadata_json={},
-            )
-        )
-
-    def _persist_agent_message(
-        self,
-        task_id: str,
-        from_agent_id: str,
-        to_agent_id: str,
-        channel: str,
-        message_type: str,
-        content: str,
-    ) -> None:
-        with self._session_factory.begin() as session:
-            self._log_agent_message(
-                session,
-                task_id=task_id,
-                from_agent_id=from_agent_id,
-                to_agent_id=to_agent_id,
-                channel=channel,
-                message_type=message_type,
-                content=content,
-            )
-
-    def _log_agent_message(
-        self,
-        session: Session,
-        *,
-        task_id: str | None,
-        from_agent_id: str,
-        to_agent_id: str,
-        channel: str,
-        message_type: str,
-        content: str,
-    ) -> None:
-        session.add(
-            AgentMessage(
-                id=self._new_id("amsg"),
-                task_id=task_id,
-                from_agent_id=from_agent_id,
-                to_agent_id=to_agent_id,
-                channel=channel,
-                message_type=message_type,
-                content=content,
-                round_no=1,
-                status="sent",
-                metadata_json={},
-            )
-        )
-
-    def _write_checkpoint(
-        self,
-        session: Session,
-        *,
-        task_id: str | None,
-        agent_id: str,
-        phase: str,
-        checkpoint_kind: str,
-        summary: str,
-        state_json: dict[str, Any],
-        resume_cursor: str | None = None,
-    ) -> None:
-        session.add(
-            Checkpoint(
-                id=self._new_id("ckpt"),
-                task_id=task_id,
-                agent_id=agent_id,
-                phase=phase,
-                checkpoint_kind=checkpoint_kind,
-                summary=summary,
-                state_json=state_json,
-                resume_cursor=resume_cursor,
-                metadata_json={},
-            )
-        )
-
-    def _next_message_sequence(self, session: Session, conversation_id: str) -> int:
-        current = session.scalar(
-            select(func.max(ConversationMessage.sequence_no)).where(
-                ConversationMessage.conversation_id == conversation_id
-            )
-        )
-        return int(current or 0) + 1
-
-    def _new_id(self, prefix: str) -> str:
-        return f"{prefix}-{uuid.uuid4().hex}"

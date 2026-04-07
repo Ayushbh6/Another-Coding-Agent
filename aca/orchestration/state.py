@@ -15,9 +15,11 @@ MAX_ORIENTATION_READS = 2
 
 ACTOR_NEON = "neon"
 ACTOR_ANALYZE_WORKER = "analyze_worker"
+ACTOR_IMPLEMENT_WORKER = "implement_worker"
 
 ANALYZE_SIMPLE_ROUTE = "analyze_simple"
 ANALYZE_DELEGATED_ROUTE = "analyze_delegated"
+IMPLEMENT_ROUTE = "implement"
 ANALYZE_ROUTES = {ANALYZE_SIMPLE_ROUTE, ANALYZE_DELEGATED_ROUTE}
 
 PHASE_PRETASK = "pretask"
@@ -27,7 +29,7 @@ PHASE_TODO_READY = "todo_ready"
 PHASE_DELEGATED_WAIT = "delegated_wait"
 PHASE_SYNTHESIZE = "synthesize"
 
-TASK_ARTIFACT_NAMES = ("task.md", "plan.md", "todo.md", "findings.md", "completion.json")
+TASK_ARTIFACT_NAMES = ("task.md", "plan.md", "todo.md", "findings.md", "output.md", "completion.json")
 
 STEERING_PRETASK_LIMIT_REACHED = "pretask_limit_reached"
 STEERING_TASK_REQUIRED_NOW = "task_required_now"
@@ -39,8 +41,10 @@ STEERING_TODO_ITEM_REQUIRED = "todo_item_required"
 STEERING_TODO_REVIEW = "todo_review"
 STEERING_SPAWN_WORKER_REQUIRED = "spawn_worker_required"
 STEERING_READ_FINDINGS = "read_findings"
+STEERING_READ_OUTPUT = "read_output"
 STEERING_WORKER_CONSOLIDATING = "worker_consolidating_findings"
-STEERING_IMPLEMENT_DISABLED = "implement_disabled"
+STEERING_IMPLEMENT_WORKER_CONSOLIDATING = "worker_consolidating_output"
+STEERING_ROUTE_RECOVERY = "route_recovery"
 
 
 class NeonGuardrailError(RuntimeError):
@@ -109,3 +113,15 @@ class AnalyzeWorkerState:
     artifact_paths: dict[str, str] = field(default_factory=dict)
     findings_written: bool = False
     findings_path: str | None = None
+
+
+@dataclass(slots=True)
+class ImplementWorkerState:
+    task_id: str
+    phase: str = "delegated_execute"
+    orientation_read_calls: int = 0
+    todo_items: list[dict[str, Any]] = field(default_factory=list)
+    current_todo_id: str | None = None
+    artifact_paths: dict[str, str] = field(default_factory=dict)
+    output_written: bool = False
+    output_path: str | None = None

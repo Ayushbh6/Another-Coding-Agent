@@ -10,8 +10,10 @@ from typing import Any
 
 ACTIVE_TASKS_ROOT = Path(".aca/tasks")
 CANONICAL_REPO_DOCS = {"MEMORY.md", "patterns.md", "repo-structure.md"}
-TASK_ARTIFACTS = {"task.md", "plan.md", "todo.md", "findings.md", "completion.json"}
+TASK_ARTIFACTS = {"task.md", "plan.md", "todo.md", "findings.md", "output.md", "completion.json"}
 ROUTE_VALUES = {"analyze_simple", "analyze_delegated"}
+IMPLEMENT_ROUTE_VALUE = "implement"
+ROUTE_VALUES = ROUTE_VALUES | {IMPLEMENT_ROUTE_VALUE}
 TODO_STATUSES = {"pending", "in_progress", "completed", "skipped"}
 
 

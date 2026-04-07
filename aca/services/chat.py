@@ -3,14 +3,11 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterator
 
 from sqlalchemy import Select, delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from aca.llm.types import HistoryMode, Message
-from aca.prompts import HELPFUL_ASSISTANT_PROMPT
-from aca.runtime import AgentRunRequest, AgentRunResult, ToolLoopRuntime
+from aca.llm.types import HistoryMode
 from aca.storage.models import Conversation, ConversationMessage, User
 from aca.token_utils import estimate_json_tokens, estimate_text_tokens
 
@@ -32,23 +29,12 @@ class ConversationSummary:
     updated_at: datetime
 
 
-@dataclass(slots=True)
-class ChatStreamEvent:
-    type: str
-    text: str | None = None
-    thinking_text: str | None = None
-    final_answer: str | None = None
-    summary: ConversationSummary | None = None
-
-
 class ChatService:
     def __init__(
         self,
         session_factory: sessionmaker[Session],
-        runtime: ToolLoopRuntime,
     ) -> None:
         self._session_factory = session_factory
-        self._runtime = runtime
 
     def get_single_user(self) -> User | None:
         with self._session_factory() as session:
@@ -241,134 +227,6 @@ class ChatService:
                 raise ValueError(f"Conversation not found: {conversation_id}")
             session.execute(delete(Conversation).where(Conversation.id == conversation_id))
 
-    def stream_chat_turn(
-        self,
-        *,
-        conversation_id: str,
-        user_input: str,
-        model: str,
-        thinking_enabled: bool,
-    ) -> Iterator[ChatStreamEvent]:
-        with self._session_factory.begin() as session:
-            conversation = session.get(Conversation, conversation_id)
-            if conversation is None:
-                raise ValueError(f"Conversation not found: {conversation_id}")
-
-            visible_history = self._load_visible_history(session, conversation_id)
-            has_visible_user_messages = self._visible_user_message_count(session, conversation_id) > 0
-
-            if not has_visible_user_messages:
-                conversation.title = _conversation_title_from_query(user_input)
-            conversation.active_model = model
-            conversation.thinking_enabled = thinking_enabled
-
-            self._insert_message(
-                session,
-                conversation=conversation,
-                role="user",
-                message_kind="user",
-                content_text=user_input,
-                model_name=model,
-                thinking_enabled=thinking_enabled,
-            )
-            carryover_messages = list(visible_history)
-
-        final_run_result: AgentRunResult | None = None
-        for event in self._runtime.stream(
-            AgentRunRequest(
-                model=model,
-                user_input=user_input,
-                system_prompt=HELPFUL_ASSISTANT_PROMPT,
-                carryover_messages=carryover_messages,
-                tools=[],
-                history_mode=HistoryMode.DIALOGUE_ONLY,
-                include_reasoning=thinking_enabled,
-            )
-        ):
-            if event.type == "reasoning.delta":
-                yield ChatStreamEvent(type="reasoning.delta", thinking_text=event.delta)
-                continue
-
-            if event.type == "text.delta":
-                yield ChatStreamEvent(type="text.delta", text=event.delta)
-                continue
-
-            if event.type == "run.completed" and isinstance(event.result, AgentRunResult):
-                final_run_result = event.result
-
-        if final_run_result is None:
-            raise RuntimeError("Chat runtime ended without a final result.")
-
-        with self._session_factory.begin() as session:
-            conversation = session.get(Conversation, conversation_id)
-            if conversation is None:
-                raise RuntimeError("Conversation disappeared before assistant persistence.")
-
-            final_answer = final_run_result.final_answer or ""
-            provider_run = final_run_result.provider_runs[-1] if final_run_result.provider_runs else None
-            self._insert_message(
-                session,
-                conversation=conversation,
-                role="assistant",
-                message_kind="assistant_final",
-                content_text=final_answer,
-                content_json={
-                    "reasoning": provider_run.reasoning if provider_run is not None else "",
-                    "reasoning_details": provider_run.reasoning_details if provider_run is not None else [],
-                    "structured_output": provider_run.structured_output if provider_run is not None else None,
-                },
-                provider_name=provider_run.provider if provider_run is not None else None,
-                model_name=model,
-                thinking_enabled=thinking_enabled,
-                response_id=provider_run.response_id if provider_run is not None else None,
-                input_tokens=provider_run.usage.input_tokens if provider_run is not None else None,
-                output_tokens=provider_run.usage.output_tokens if provider_run is not None else None,
-                total_tokens=provider_run.usage.total_tokens if provider_run is not None else None,
-                reasoning_tokens=provider_run.usage.reasoning_tokens if provider_run is not None else None,
-                latency_ms=provider_run.latency_ms if provider_run is not None else None,
-                metadata_json={
-                    "provider_metadata": provider_run.provider_metadata if provider_run is not None else {},
-                    "raw_usage": provider_run.usage.raw if provider_run is not None else {},
-                },
-            )
-            summary = self._build_conversation_summary(session, conversation)
-
-        yield ChatStreamEvent(
-            type="completed",
-            final_answer=final_run_result.final_answer,
-            summary=summary,
-        )
-
-    def _load_visible_history(self, session: Session, conversation_id: str) -> list[Message]:
-        rows = session.scalars(
-            select(ConversationMessage)
-            .where(
-                ConversationMessage.conversation_id == conversation_id,
-                ConversationMessage.visibility_status == VISIBLE_MESSAGE_STATUS,
-            )
-            .order_by(ConversationMessage.sequence_no)
-        ).all()
-        return [
-            Message(
-                role=row.role,
-                content=row.content_text,
-                reasoning=(row.content_json or {}).get("reasoning") if row.role == "assistant" else None,
-                reasoning_details=(row.content_json or {}).get("reasoning_details", []) if row.role == "assistant" else [],
-            )
-            for row in rows
-            if row.role in {"user", "assistant"} and row.message_kind in {"user", "assistant_final"}
-        ]
-
-    def _visible_user_message_count(self, session: Session, conversation_id: str) -> int:
-        count = session.scalar(
-            select(func.count(ConversationMessage.id)).where(
-                ConversationMessage.conversation_id == conversation_id,
-                ConversationMessage.visibility_status == VISIBLE_MESSAGE_STATUS,
-                ConversationMessage.role == "user",
-            )
-        )
-        return int(count or 0)
-
     def _build_conversation_summary(self, session: Session, conversation: Conversation) -> ConversationSummary:
         aggregates = session.execute(
             select(
@@ -467,10 +325,3 @@ class ChatService:
 
     def _new_id(self, prefix: str) -> str:
         return f"{prefix}-{uuid.uuid4().hex}"
-
-
-def _conversation_title_from_query(user_input: str) -> str:
-    words = user_input.strip().split()
-    if not words:
-        return "New chat"
-    return " ".join(words[:3])

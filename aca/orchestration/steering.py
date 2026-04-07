@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from aca.orchestration.state import (
-    STEERING_IMPLEMENT_DISABLED,
+    STEERING_IMPLEMENT_WORKER_CONSOLIDATING,
     STEERING_ORIENTATION_DELEGATED,
     STEERING_ORIENTATION_SIMPLE,
     STEERING_PLAN_REQUIRED,
     STEERING_PRETASK_LIMIT_REACHED,
     STEERING_READ_FINDINGS,
+    STEERING_READ_OUTPUT,
+    STEERING_ROUTE_RECOVERY,
     STEERING_SPAWN_WORKER_REQUIRED,
     STEERING_TASK_REQUIRED_NOW,
     STEERING_TODO_ITEM_REQUIRED,
@@ -27,11 +29,12 @@ FRONTEND_STEERING_MESSAGES = {
     STEERING_TODO_REVIEW: "Nice, one item down. Review the remaining list and either continue with the next item or revise the plan with a reason and confidence score.",
     STEERING_SPAWN_WORKER_REQUIRED: "Everything is staged. Next move is the worker handoff.",
     STEERING_READ_FINDINGS: "The worker has landed. Read `findings.md` and `completion.json`, then synthesize the answer.",
+    STEERING_READ_OUTPUT: "The implement worker has landed. Read `output.md` and `completion.json`, then synthesize the answer.",
     STEERING_WORKER_CONSOLIDATING: "The worker has enough evidence and is now stitching it into `findings.md`.",
-    STEERING_IMPLEMENT_DISABLED: "Code changes are disabled in this build right now. I can analyze the codebase, but I won't mutate the repo yet.",
+    STEERING_IMPLEMENT_WORKER_CONSOLIDATING: "The implement worker has finished the todo and is now stitching the execution summary into `output.md`.",
+    STEERING_ROUTE_RECOVERY: "The current route is invalid for the task state. Re-anchor on the allowed workflow tools.",
 }
 
 
 def steering_message(code: str, fallback: str | None = None) -> str:
     return FRONTEND_STEERING_MESSAGES.get(code, fallback or code)
-

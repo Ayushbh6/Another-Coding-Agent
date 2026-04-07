@@ -7,16 +7,18 @@ from typing import Any
 from aca.orchestration.state import (
     ANALYZE_DELEGATED_ROUTE,
     ANALYZE_SIMPLE_ROUTE,
+    IMPLEMENT_ROUTE,
     PHASE_SYNTHESIZE,
     PHASE_TODO_READY,
     STEERING_TODO_REVIEW,
     AnalyzeWorkerState,
+    ImplementWorkerState,
     NeonGuardrailError,
     NeonRunState,
 )
 
 
-TodoState = NeonRunState | AnalyzeWorkerState
+TodoState = NeonRunState | AnalyzeWorkerState | ImplementWorkerState
 PersistTodoCallback = Callable[..., None]
 IdFactory = Callable[[str], str]
 
@@ -110,7 +112,9 @@ class TodoController:
         )
         summary = (
             "Completed the final delegated todo item. Write findings.md now."
-            if self._actor == "worker" and todo_is_complete(self._state.todo_items)
+            if self._actor == "worker" and self._route == ANALYZE_DELEGATED_ROUTE and todo_is_complete(self._state.todo_items)
+            else "Completed the final delegated implement todo item. Write output.md now."
+            if self._actor == "worker" and self._route == IMPLEMENT_ROUTE and todo_is_complete(self._state.todo_items)
             else "Completed the final todo item. You may now synthesize the answer."
             if todo_is_complete(self._state.todo_items)
             else "Todo item completed. Review the remaining items. Either start the next one or revise the todo with a reason and confidence score."
@@ -151,7 +155,9 @@ class TodoController:
         )
         summary = (
             "Skipped the final delegated todo item. Write findings.md now."
-            if self._actor == "worker" and todo_is_complete(self._state.todo_items)
+            if self._actor == "worker" and self._route == ANALYZE_DELEGATED_ROUTE and todo_is_complete(self._state.todo_items)
+            else "Skipped the final delegated implement todo item. Write output.md now."
+            if self._actor == "worker" and self._route == IMPLEMENT_ROUTE and todo_is_complete(self._state.todo_items)
             else "Skipped the final todo item. You may now synthesize the answer."
             if todo_is_complete(self._state.todo_items)
             else "Todo item skipped. Review the remaining items. Either start the next one or revise the todo with a reason and confidence score."
@@ -216,8 +222,8 @@ class TodoController:
         self._ensure_todo_exists()
         if self._actor == "neon" and self._route != ANALYZE_SIMPLE_ROUTE:
             raise NeonGuardrailError("todo_item_required", "Neon may only execute todo items directly for analyze_simple.")
-        if self._actor == "worker" and self._route != ANALYZE_DELEGATED_ROUTE:
-            raise NeonGuardrailError("todo_item_required", "Worker todo execution is only available for delegated analysis.")
+        if self._actor == "worker" and self._route not in {ANALYZE_DELEGATED_ROUTE, IMPLEMENT_ROUTE}:
+            raise NeonGuardrailError("todo_item_required", "Worker todo execution is only available for delegated analysis or implement.")
 
     def _ensure_todo_exists(self) -> None:
         if not self._state.task_id or not self._state.todo_items:

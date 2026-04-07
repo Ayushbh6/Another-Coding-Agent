@@ -15,13 +15,13 @@ from aca.config import Settings
 from aca.llm.providers.base import LLMProvider
 from aca.llm.types import Message, ProviderEvent, ProviderRequest, RunResult, ToolCall, UsageStats
 from aca.orchestration import NeonOrchestrator
-from aca.orchestration.state import ACTOR_NEON, NeonRunState
+from aca.orchestration.state import ACTOR_IMPLEMENT_WORKER, ACTOR_NEON, ImplementWorkerState, NeonRunState
 from aca.orchestration.tools import OrchestrationToolRegistry
-from aca.orchestration.prompts import ANALYZE_WORKER_PROMPT, NEON_PROMPT
+from aca.orchestration.prompts import ANALYZE_WORKER_PROMPT, IMPLEMENT_WORKER_PROMPT, NEON_PROMPT
 from aca.storage import initialize_storage
 from aca.storage.models import Action, Conversation, Task
 from aca.task_workspace import TaskWorkspaceManager
-from aca.workspace_tools import WorkspaceToolContext, WorkspaceToolRegistry
+from aca.tools import WorkspaceToolContext, WorkspaceToolRegistry
 
 
 class FakeNeonProvider(LLMProvider):
@@ -42,6 +42,10 @@ class FakeNeonProvider(LLMProvider):
 
         if ANALYZE_WORKER_PROMPT.splitlines()[0] in system_prompt:
             yield from self._worker_response(request, tool_messages)
+            return
+
+        if IMPLEMENT_WORKER_PROMPT.splitlines()[0] in system_prompt:
+            yield from self._implement_worker_response(request, tool_messages)
             return
 
         raise AssertionError(f"Unhandled system prompt: {system_prompt!r}")
@@ -66,8 +70,125 @@ class FakeNeonProvider(LLMProvider):
             yield from self._text_response(request, "Neon chat reply.", response_id="neon-chat-1")
             return
 
-        if route == "implement_disabled":
-            yield from self._text_response(request, "Implementation mode is currently disabled. I can analyze the repo, but I will not mutate it.", response_id="neon-impl-1")
+        if route == "chat_with_scout":
+            if "get_repo_summary" not in tool_names:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="neon-summary-1", name="get_repo_summary", arguments="{}"),
+                    response_id="neon-summary-1",
+                    narration="I’m doing a quick scout pass before I answer.",
+                )
+                return
+            if "read_file" not in tool_names:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="neon-readme-1", name="read_file", arguments='{"path":"README.md","start_line":1,"end_line":8}'),
+                    response_id="neon-readme-1",
+                    narration="I only need one targeted read to confirm it.",
+                )
+                return
+            yield from self._text_response(request, "The repo is named ACA.", response_id="neon-chat-scout-1")
+            return
+
+        if route == "implement":
+            if not tool_messages:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="neon-impl-list-1", name="list_files", arguments='{"path":".","limit":20,"max_depth":2}'),
+                    response_id="neon-impl-list-1",
+                    narration="I’m checking the repo shape before I start the implementation task.",
+                )
+                return
+            if "task.md" not in written_artifacts:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(
+                        id="neon-impl-task-1",
+                        name="write_task_artifact",
+                        arguments=json.dumps(
+                            {
+                                "artifact_name": "task.md",
+                                "content": (
+                                    "---\n"
+                                    f"task_id: {task_id}\n"
+                                    "intent: implement\n"
+                                    "route: implement\n"
+                                    "title: Fix the orchestrator stub\n"
+                                    "---\n"
+                                    "Update the orchestrator stub and add a small implementation note.\n"
+                                ),
+                            }
+                        ),
+                    ),
+                    response_id="neon-impl-task-1",
+                    narration="This needs a tracked implementation task.",
+                )
+                return
+            if tool_names.count("read_file") < 1:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="neon-impl-read-1", name="read_file", arguments='{"path":"aca/orchestration/orchestrator.py","start_line":1,"end_line":40}'),
+                    response_id="neon-impl-read-1",
+                    narration="I’m doing a quick orientation read before I write the plan.",
+                )
+                return
+            if "plan.md" not in written_artifacts:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(
+                        id="neon-impl-plan-1",
+                        name="write_task_artifact",
+                        arguments=json.dumps(
+                            {
+                                "artifact_name": "plan.md",
+                                "content": "# Plan\n\n1. Update the orchestrator stub.\n2. Add an implementation note file.\n3. Verify the workspace with a safe command.\n",
+                            }
+                        ),
+                    ),
+                    response_id="neon-impl-plan-1",
+                    narration="I have enough context to write the implementation plan.",
+                )
+                return
+            if "todo.md" not in written_artifacts:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(
+                        id="neon-impl-todo-1",
+                        name="write_task_artifact",
+                        arguments=json.dumps(
+                            {
+                                "artifact_name": "todo.md",
+                                "content": "- update the orchestrator stub\n- add an implementation note file\n",
+                            }
+                        ),
+                    ),
+                    response_id="neon-impl-todo-1",
+                    narration="The plan is ready, so now I’m deriving the implementation todo from it.",
+                )
+                return
+            if not spawn_scheduled:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="neon-impl-spawn-1", name="spawn_implement_worker", arguments="{}"),
+                    response_id="neon-impl-spawn-1",
+                    narration="Everything is staged. Handing the implementation to the worker now.",
+                )
+                return
+            if "output.md" not in [payload.get("artifact_name") for payload in tool_payloads if isinstance(payload, dict)]:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="neon-output-read", name="read_task_artifact", arguments='{"artifact_name":"output.md"}'),
+                    response_id="neon-output-read",
+                )
+                return
+            if "completion.json" not in [payload.get("artifact_name") for payload in tool_payloads if isinstance(payload, dict)]:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="neon-impl-completion-read", name="read_task_artifact", arguments='{"artifact_name":"completion.json"}'),
+                    response_id="neon-impl-completion-read",
+                )
+                return
+            yield from self._text_response(request, "Implementation complete.", response_id="neon-impl-final")
             return
 
         if route == "analyze_simple":
@@ -430,10 +551,158 @@ class FakeNeonProvider(LLMProvider):
             return
         yield from self._text_response(request, "Worker finished.", response_id="worker-final")
 
+    def _implement_worker_response(self, request: ProviderRequest, tool_messages: list[Message]) -> Iterator[ProviderEvent]:
+        tool_names = [self._tool_name(message) for message in tool_messages]
+        tool_payloads = [self._tool_payload(message) for message in tool_messages]
+        if "read_task_artifact" not in tool_names:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(id="impl-worker-task-1", name="read_task_artifact", arguments='{"artifact_name":"task.md"}'),
+                response_id="impl-worker-task-1",
+                narration="I have the handoff. Reading the implement artifacts first.",
+            )
+            return
+        if tool_names.count("read_task_artifact") == 1:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(id="impl-worker-plan-1", name="read_task_artifact", arguments='{"artifact_name":"plan.md"}'),
+                response_id="impl-worker-plan-1",
+            )
+            return
+        if tool_names.count("read_task_artifact") == 2:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(id="impl-worker-todo-1", name="read_task_artifact", arguments='{"artifact_name":"todo.md"}'),
+                response_id="impl-worker-todo-1",
+            )
+            return
+        if "read_todo_state" not in tool_names:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(id="impl-worker-todo-state-1", name="read_todo_state", arguments="{}"),
+                response_id="impl-worker-todo-state-1",
+            )
+            return
+        todo_payload = next(
+            (payload for payload in reversed(tool_payloads) if isinstance(payload, dict) and payload.get("items")),
+            None,
+        )
+        todo_items = todo_payload.get("items", []) if isinstance(todo_payload, dict) else []
+        started_ids = {str(payload.get("todo_id")) for payload in tool_payloads if isinstance(payload, dict) and payload.get("status") == "in_progress"}
+        completed_ids = {str(payload.get("todo_id")) for payload in tool_payloads if isinstance(payload, dict) and payload.get("status") == "completed"}
+        if todo_items:
+            first_id = str(todo_items[0]["todo_id"])
+            if first_id not in started_ids and first_id not in completed_ids:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="impl-worker-start-1", name="start_todo_item", arguments=json.dumps({"todo_id": first_id})),
+                    response_id="impl-worker-start-1",
+                    narration="Starting with the first implementation todo item.",
+                )
+                return
+            if "edit_file" not in tool_names:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(
+                        id="impl-worker-edit-1",
+                        name="edit_file",
+                        arguments=json.dumps(
+                            {
+                                "path": "aca/orchestration/orchestrator.py",
+                                "edits": [{"op": "replace_exact", "old_text": "    pass\n", "new_text": "    implemented = True\n"}],
+                            }
+                        ),
+                    ),
+                    response_id="impl-worker-edit-1",
+                )
+                return
+            if "run_command" not in tool_names:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="impl-worker-cmd-1", name="run_command", arguments=json.dumps({"command": "pwd", "cwd": ".", "timeout_sec": 5})),
+                    response_id="impl-worker-cmd-1",
+                )
+                return
+            if first_id not in completed_ids:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(
+                        id="impl-worker-complete-1",
+                        name="complete_todo_item",
+                        arguments=json.dumps({"todo_id": first_id, "outcome": "Updated the stub and verified command execution access."}),
+                    ),
+                    response_id="impl-worker-complete-1",
+                )
+                return
+        if len(todo_items) > 1:
+            second_id = str(todo_items[1]["todo_id"])
+            if second_id not in started_ids and second_id not in completed_ids:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="impl-worker-start-2", name="start_todo_item", arguments=json.dumps({"todo_id": second_id})),
+                    response_id="impl-worker-start-2",
+                )
+                return
+            if "file_ops" not in tool_names:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="impl-worker-fileops-1", name="file_ops", arguments=json.dumps({"operations": [{"op": "mkdir", "path": "docs"}]})),
+                    response_id="impl-worker-fileops-1",
+                )
+                return
+            if "write_file" not in tool_names:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(
+                        id="impl-worker-write-1",
+                        name="write_file",
+                        arguments=json.dumps(
+                            {
+                                "path": "docs/implement-note.md",
+                                "content": "# Implement Note\n\nThe orchestrator stub was updated by the implement worker.\n",
+                                "overwrite": False,
+                            }
+                        ),
+                    ),
+                    response_id="impl-worker-write-1",
+                )
+                return
+            if second_id not in completed_ids:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(
+                        id="impl-worker-complete-2",
+                        name="complete_todo_item",
+                        arguments=json.dumps({"todo_id": second_id, "outcome": "Created the implementation note file."}),
+                    ),
+                    response_id="impl-worker-complete-2",
+                )
+                return
+        if "write_task_artifact" not in tool_names:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(
+                    id="impl-worker-output-1",
+                    name="write_task_artifact",
+                    arguments=json.dumps(
+                        {
+                            "artifact_name": "output.md",
+                            "content": "# Output\n\nChanged `aca/orchestration/orchestrator.py`, created `docs/implement-note.md`, and ran `pwd` successfully.\n",
+                        }
+                    ),
+                ),
+                response_id="impl-worker-output-1",
+                narration="The implementation todo is complete. I’m consolidating the execution summary now.",
+            )
+            return
+        yield from self._text_response(request, "Implement worker finished.", response_id="impl-worker-final")
+
     def _route_for_request(self, full_user_text: str) -> str:
         lowered = full_user_text.lower()
         if any(word in lowered for word in ("fix ", "implement", "edit ", "refactor")):
-            return "implement_disabled"
+            return "implement"
+        if "name of this repo" in lowered or "repo name" in lowered:
+            return "chat_with_scout"
         if "scan the codebase" in lowered or "codebase" in lowered or "architecture" in lowered:
             return "analyze_delegated"
         if "analyze" in lowered or "inspect" in lowered:
@@ -546,6 +815,7 @@ class NeonOrchestratorTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         (self.root / "aca" / "orchestration").mkdir(parents=True, exist_ok=True)
+        (self.root / "README.md").write_text("# ACA\n\nAnother Coding Agent.\n", encoding="utf-8")
         (self.root / "aca" / "orchestration" / "orchestrator.py").write_text("class NeonOrchestrator:\n    pass\n", encoding="utf-8")
         (self.root / "aca" / "orchestration" / "tools.py").write_text("class OrchestrationToolRegistry:\n    pass\n", encoding="utf-8")
         settings = Settings(
@@ -619,6 +889,46 @@ class NeonOrchestratorTests(unittest.TestCase):
         with self.storage.session_factory() as session:
             self.assertEqual(session.scalar(select(func.count()).select_from(Task)), 0)
 
+    def test_chat_can_answer_after_scout_reads_without_task_workspace(self) -> None:
+        events = self._run("what is the name of this repo?")
+        text_events = [event for event in events if event.type == "text.delta"]
+        self.assertTrue(text_events)
+        self.assertTrue("".join(event.text or "" for event in text_events).endswith("The repo is named ACA."))
+        completed = next(event for event in events if event.type == "completed")
+        self.assertEqual(completed.final_answer, "The repo is named ACA.")
+        self.assertFalse((self.root / ".aca").exists())
+        status_messages = [event.message for event in events if event.type == "worker.status" and event.message]
+        self.assertFalse(any("task.md" in message for message in status_messages))
+        with self.storage.session_factory() as session:
+            self.assertEqual(session.scalar(select(func.count()).select_from(Task)), 0)
+
+    def test_scout_assisted_chat_streams_live_text(self) -> None:
+        orchestrator = self._orchestrator()
+        chat_state = NeonRunState(
+            conversation_id="conv-1",
+            user_input="what is the name of this repo?",
+            user_name="Ayush",
+            planned_task_id="task-chat",
+            model="fake-model",
+            thinking_enabled=False,
+            carryover_messages=[],
+            pretask_read_calls=2,
+        )
+        analysis_state = NeonRunState(
+            conversation_id="conv-1",
+            user_input="scan the codebase and explain the architecture",
+            user_name="Ayush",
+            planned_task_id="task-analysis",
+            model="fake-model",
+            thinking_enabled=False,
+            carryover_messages=[],
+            pretask_read_calls=2,
+        )
+
+        self.assertTrue(orchestrator._should_stream_live_text(chat_state))
+        # With heuristics removed, agent decides the route — all pre-task text streams live.
+        self.assertTrue(orchestrator._should_stream_live_text(analysis_state))
+
     def test_simple_analyze_creates_task_and_executes_todo(self) -> None:
         events = self._run("inspect the repo and explain the main flow")
         completed = next(event for event in events if event.type == "completed")
@@ -654,14 +964,15 @@ class NeonOrchestratorTests(unittest.TestCase):
             self.assertTrue(any(action.action_type == "todo_item_completed" for action in worker_actions))
 
     def test_premature_no_tool_answer_is_suppressed(self) -> None:
+        """With heuristics removed, agent is trusted to answer directly even for
+        analysis-type requests.  The premature answer is accepted as the agent's
+        deliberate choice to respond without creating a task."""
         events = self._run(
             "scan the codebase and tell me how the agent architecture works",
             provider=PrematureAnswerProvider(),
         )
         all_text = "".join(event.text or "" for event in events if getattr(event, "text", None))
-        self.assertNotIn("Premature architectural explanation that should never be shown.", all_text)
-        status_messages = [event.message for event in events if event.type == "worker.status" and event.message]
-        self.assertTrue(any("task" in message.lower() or "scout" in message.lower() for message in status_messages))
+        self.assertIn("Premature architectural explanation that should never be shown.", all_text)
 
     def test_tool_errors_are_rendered_as_errors(self) -> None:
         orchestrator = self._orchestrator()
@@ -736,13 +1047,124 @@ class NeonOrchestratorTests(unittest.TestCase):
         self.assertNotIn("search_code", tool_names)
         self.assertIn("write_task_artifact", tool_names)
 
-    def test_implement_request_is_disabled_without_task(self) -> None:
+    def test_implement_route_keeps_neon_read_only_but_exposes_coding_tools_to_worker(self) -> None:
+        implement_state = NeonRunState(
+            conversation_id="conv-1",
+            user_input="fix the bug in aca/orchestration/orchestrator.py",
+            user_name="Ayush",
+            planned_task_id="task-implement",
+            model="fake-model",
+            thinking_enabled=False,
+            carryover_messages=[],
+            task_id="task-implement",
+            route="implement",
+            task_written=True,
+            plan_written=True,
+            todo_written=True,
+            todo_items=[{"todo_id": "todo-1", "title": "Update the orchestrator stub", "status": "pending"}],
+        )
+        analyze_state = NeonRunState(
+            conversation_id="conv-1",
+            user_input="inspect the repo and explain the main flow",
+            user_name="Ayush",
+            planned_task_id="task-analyze",
+            model="fake-model",
+            thinking_enabled=False,
+            carryover_messages=[],
+            task_id="task-analyze",
+            route="analyze_simple",
+            task_written=True,
+            todo_written=True,
+            todo_items=[{"todo_id": "todo-1", "title": "Inspect the orchestrator", "status": "pending"}],
+        )
+        implement_context = WorkspaceToolContext(
+            root=self.root,
+            session_factory=self.storage.session_factory,
+            task_id="task-implement",
+            agent_id="master",
+            approval_policy=AllowAllApprovalPolicy(),
+        )
+        analyze_context = WorkspaceToolContext(
+            root=self.root,
+            session_factory=self.storage.session_factory,
+            task_id="task-analyze",
+            agent_id="master",
+            approval_policy=AllowAllApprovalPolicy(),
+        )
+        implement_worker_context = WorkspaceToolContext(
+            root=self.root,
+            session_factory=self.storage.session_factory,
+            task_id="task-implement",
+            agent_id="worker",
+            approval_policy=AllowAllApprovalPolicy(),
+            auto_approve_tools=frozenset({"write_file", "edit_file", "file_ops"}),
+        )
+        implement_worker_state = ImplementWorkerState(
+            task_id="task-implement",
+            todo_items=[{"todo_id": "todo-1", "title": "Update the orchestrator stub", "status": "pending"}],
+        )
+        implement_registry = OrchestrationToolRegistry(
+            orchestrator=self._orchestrator(),
+            actor=ACTOR_NEON,
+            route="implement",
+            state=implement_state,
+            workspace_manager=TaskWorkspaceManager(self.root, self.root / ".archive"),
+            read_registry=WorkspaceToolRegistry(implement_context),
+            context=implement_context,
+        )
+        implement_worker_registry = OrchestrationToolRegistry(
+            orchestrator=self._orchestrator(),
+            actor=ACTOR_IMPLEMENT_WORKER,
+            route="implement",
+            state=implement_worker_state,
+            workspace_manager=TaskWorkspaceManager(self.root, self.root / ".archive"),
+            read_registry=WorkspaceToolRegistry(implement_worker_context),
+            context=implement_worker_context,
+        )
+        analyze_registry = OrchestrationToolRegistry(
+            orchestrator=self._orchestrator(),
+            actor=ACTOR_NEON,
+            route="analyze_simple",
+            state=analyze_state,
+            workspace_manager=TaskWorkspaceManager(self.root, self.root / ".archive"),
+            read_registry=WorkspaceToolRegistry(analyze_context),
+            context=analyze_context,
+        )
+
+        implement_tool_names = {tool["function"]["name"] for tool in implement_registry.schemas()}
+        implement_worker_tool_names = {tool["function"]["name"] for tool in implement_worker_registry.schemas()}
+        analyze_tool_names = {tool["function"]["name"] for tool in analyze_registry.schemas()}
+
+        self.assertFalse({"write_file", "edit_file", "file_ops", "run_command"} & implement_tool_names)
+        self.assertTrue({"spawn_implement_worker", "read_task_artifact"}.issubset(implement_tool_names))
+        self.assertFalse({"read_file", "search_code"} & implement_tool_names)
+        self.assertTrue({"write_file", "edit_file", "file_ops", "run_command", "read_todo_state"}.issubset(implement_worker_tool_names))
+        self.assertFalse({"write_file", "edit_file", "file_ops", "run_command"} & analyze_tool_names)
+
+    def test_implement_route_delegates_to_worker_and_reads_output(self) -> None:
         events = self._run("fix the bug in aca/orchestration/orchestrator.py")
         completed = next(event for event in events if event.type == "completed")
-        self.assertIn("disabled", completed.final_answer.lower())
-        self.assertFalse((self.root / ".aca").exists())
+        self.assertEqual(completed.final_answer, "Implementation complete.")
+        task_dir = next((self.root / ".aca" / "tasks").iterdir())
+        self.assertTrue((task_dir / "task.md").exists())
+        self.assertTrue((task_dir / "todo.md").exists())
+        self.assertTrue((task_dir / "plan.md").exists())
+        self.assertTrue((task_dir / "output.md").exists())
+        self.assertTrue((task_dir / "completion.json").exists())
+        orchestrator_text = (self.root / "aca" / "orchestration" / "orchestrator.py").read_text(encoding="utf-8")
+        self.assertIn("implemented = True", orchestrator_text)
+        self.assertTrue((self.root / "docs" / "implement-note.md").exists())
+        worker_events = [event for event in events if getattr(event, "agent", None) == "worker"]
+        self.assertTrue(worker_events)
         with self.storage.session_factory() as session:
-            self.assertEqual(session.scalar(select(func.count()).select_from(Task)), 0)
+            actions = session.scalars(select(Action).order_by(Action.started_at.asc())).all()
+            action_types = [action.action_type for action in actions]
+            self.assertIn("todo_item_started", action_types)
+            self.assertIn("todo_item_completed", action_types)
+            self.assertIn("tool:edit_file", action_types)
+            self.assertIn("tool:write_file", action_types)
+            self.assertIn("tool:file_ops", action_types)
+            self.assertIn("tool:run_command", action_types)
 
     def test_archive_sweep_moves_completed_task_out_of_repo(self) -> None:
         self._run("inspect the repo and explain the main flow")

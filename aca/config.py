@@ -28,7 +28,6 @@ OPENROUTER_MODEL_ORDER: list[str] = [
 ]
 
 DEFAULT_OPENROUTER_MODEL_KEY = "kimi_k2_5"
-DEFAULT_CLASSIFICATION_MODEL_KEY = DEFAULT_OPENROUTER_MODEL_KEY
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +36,6 @@ class Settings:
     chroma_path: str = DEFAULT_CHROMA_PATH
     chroma_collection: str = DEFAULT_CHROMA_COLLECTION
     default_openrouter_model: str = OPENROUTER_MODELS[DEFAULT_OPENROUTER_MODEL_KEY]
-    default_classification_model: str = OPENROUTER_MODELS[DEFAULT_CLASSIFICATION_MODEL_KEY]
 
 
 def get_settings() -> Settings:
@@ -48,9 +46,6 @@ def get_settings() -> Settings:
         chroma_collection=os.getenv("ACA_CHROMA_COLLECTION", DEFAULT_CHROMA_COLLECTION),
         default_openrouter_model=resolve_openrouter_model(
             os.getenv("ACA_OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL_KEY)
-        ),
-        default_classification_model=resolve_openrouter_model(
-            os.getenv("ACA_CLASSIFICATION_MODEL", DEFAULT_CLASSIFICATION_MODEL_KEY)
         ),
     )
 
