@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from rich.console import Console
 from sqlalchemy import select
@@ -214,6 +215,20 @@ class ChatCliRenderingTests(unittest.TestCase):
         self.assertIn("neon thinking> Analyzing the request. Choosing next step.", output)
         self.assertIn("neon>", output)
         self.assertIn("Final answer.", output)
+
+    def test_send_chat_message_does_not_render_streamed_text_as_markdown(self) -> None:
+        app = object.__new__(ChatCLIApp)
+        app.console = Console(record=True, force_terminal=False, color_system=None)
+        app.triage = FakeNeonOrchestratorForCli()
+        app.state = CliSessionState(
+            active_user_id="user-1",
+            active_conversation_id="conv-1",
+            active_model="fake-model",
+            thinking_enabled=True,
+        )
+
+        with patch("aca.cli.app.Markdown", side_effect=AssertionError("streamed text should not use Markdown")):
+            app._send_chat_message("hello")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@ from aca.orchestration.state import (
     PHASE_SYNTHESIZE,
     PHASE_TODO_READY,
     STEERING_TODO_REVIEW,
+    STEERING_WORKER_WRITE_FINDINGS_NOW,
+    STEERING_WORKER_WRITE_OUTPUT_NOW,
     AnalyzeWorkerState,
     ImplementWorkerState,
     NeonGuardrailError,
@@ -121,13 +123,22 @@ class TodoController:
         )
         if self._actor == "worker" and not todo_is_complete(self._state.todo_items):
             summary = "Delegated todo item completed. Review the remaining items. Either start the next one or revise the todo with a reason and confidence score."
+        all_done = todo_is_complete(self._state.todo_items)
+        if all_done and self._actor == "worker" and self._route == ANALYZE_DELEGATED_ROUTE:
+            done_steering = STEERING_WORKER_WRITE_FINDINGS_NOW
+        elif all_done and self._actor == "worker" and self._route == IMPLEMENT_ROUTE:
+            done_steering = STEERING_WORKER_WRITE_OUTPUT_NOW
+        elif all_done:
+            done_steering = None
+        else:
+            done_steering = STEERING_TODO_REVIEW
         return json.dumps(
             {
                 "todo_id": todo_id,
                 "status": "completed",
                 "summary": summary,
                 "remaining_items": self._remaining_items(),
-                "steering_code": STEERING_TODO_REVIEW if not todo_is_complete(self._state.todo_items) else None,
+                "steering_code": done_steering,
             }
         )
 
@@ -164,13 +175,22 @@ class TodoController:
         )
         if self._actor == "worker" and not todo_is_complete(self._state.todo_items):
             summary = "Delegated todo item skipped. Review the remaining items. Either start the next one or revise the todo with a reason and confidence score."
+        all_done = todo_is_complete(self._state.todo_items)
+        if all_done and self._actor == "worker" and self._route == ANALYZE_DELEGATED_ROUTE:
+            done_steering = STEERING_WORKER_WRITE_FINDINGS_NOW
+        elif all_done and self._actor == "worker" and self._route == IMPLEMENT_ROUTE:
+            done_steering = STEERING_WORKER_WRITE_OUTPUT_NOW
+        elif all_done:
+            done_steering = None
+        else:
+            done_steering = STEERING_TODO_REVIEW
         return json.dumps(
             {
                 "todo_id": todo_id,
                 "status": "skipped",
                 "summary": summary,
                 "remaining_items": self._remaining_items(),
-                "steering_code": STEERING_TODO_REVIEW if not todo_is_complete(self._state.todo_items) else None,
+                "steering_code": done_steering,
             }
         )
 

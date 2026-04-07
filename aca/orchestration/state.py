@@ -44,6 +44,8 @@ STEERING_READ_FINDINGS = "read_findings"
 STEERING_READ_OUTPUT = "read_output"
 STEERING_WORKER_CONSOLIDATING = "worker_consolidating_findings"
 STEERING_IMPLEMENT_WORKER_CONSOLIDATING = "worker_consolidating_output"
+STEERING_WORKER_WRITE_FINDINGS_NOW = "worker_write_findings_now"
+STEERING_WORKER_WRITE_OUTPUT_NOW = "worker_write_output_now"
 STEERING_ROUTE_RECOVERY = "route_recovery"
 
 
@@ -97,10 +99,11 @@ class NeonRunState:
     worker_summary: str = ""
     artifact_paths: dict[str, str] = field(default_factory=dict)
     repo_summary_used: bool = False
-    # Accumulated real API token usage across all Neon + worker LLM calls in this turn
+    # Real API token usage across all Neon + worker LLM calls in this turn.
+    # input_tokens: peak context window (max across calls — each call already includes prior messages).
+    # output_tokens: cumulative generation (sum across calls).
     turn_input_tokens: int = 0
     turn_output_tokens: int = 0
-    turn_total_tokens: int = 0
 
 
 @dataclass(slots=True)

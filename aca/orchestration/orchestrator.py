@@ -214,7 +214,7 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                 model_name=model,
                 input_tokens=state.turn_input_tokens or None,
                 output_tokens=state.turn_output_tokens or None,
-                total_tokens=state.turn_total_tokens or None,
+                total_tokens=(state.turn_input_tokens + state.turn_output_tokens) or None,
                 metadata_json={"orchestration": "neon"},
             )
 
@@ -350,9 +350,8 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                     continue
 
                 if event.type == "usage.update":
-                    state.turn_input_tokens += event.metadata.get("input_tokens", 0)
+                    state.turn_input_tokens = max(state.turn_input_tokens, event.metadata.get("input_tokens", 0))
                     state.turn_output_tokens += event.metadata.get("output_tokens", 0)
-                    state.turn_total_tokens += event.metadata.get("total_tokens", 0)
                     continue
 
                 if event.type == "text.delta":
@@ -373,6 +372,18 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                     yield from flush_pending_text()
                     tool_name = event.tool_call.name if event.tool_call is not None else "unknown"
                     steering_code = self._steering_code_from_result(event.delta)
+                    tool_ok = event.metadata.get("ok", True)
+                    if not tool_ok:
+                        self._record_runtime_action(
+                            task_id=state.task_id,
+                            agent_id="master",
+                            action_type=f"tool:{tool_name}",
+                            target=None,
+                            input_json=event.metadata.get("arguments", {}),
+                            result_json={"raw": (event.delta or "")[:500]},
+                            status="failed",
+                            error_text=(event.delta or "")[:1000],
+                        )
                     if event.tool_call is not None:
                         cycle_history_messages.append(
                             Message(
@@ -432,7 +443,10 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                 artifact_name = "output.md" if state.route == IMPLEMENT_ROUTE else "findings.md"
                 correction_message = (
                     f"{self._run_instructions(state)}\n\n"
-                    f"The delegated worker phase has finished. Read {artifact_name} and completion.json now and synthesize the final answer."
+                    f"The delegated worker phase has finished. Read {artifact_name} and completion.json now and synthesize the final answer.\n\n"
+                    "IMPORTANT: Your synthesis must be concise — at most ~200 lines of markdown for analysis, ~100 for implementation. "
+                    f"Do NOT reproduce the full contents of {artifact_name}. Summarize the key findings, patterns, and conclusions. "
+                    "The user can ask follow-up questions if they need more detail."
                 )
                 # Use the actual tool-call history accumulated during this cycle.
                 # _delegated_progress_messages produces synthetic role="tool" messages with no
@@ -653,9 +667,8 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                         continue
 
                     if event.type == "usage.update":
-                        state.turn_input_tokens += event.metadata.get("input_tokens", 0)
+                        state.turn_input_tokens = max(state.turn_input_tokens, event.metadata.get("input_tokens", 0))
                         state.turn_output_tokens += event.metadata.get("output_tokens", 0)
-                        state.turn_total_tokens += event.metadata.get("total_tokens", 0)
                         continue
 
                     if event.type == "runtime.tool_result":
@@ -671,6 +684,18 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                                 )
                             pending_text_chunks = []
                         tool_name = event.tool_call.name if event.tool_call is not None else "unknown"
+                        tool_ok = event.metadata.get("ok", True)
+                        if not tool_ok:
+                            self._record_runtime_action(
+                                task_id=state.task_id,
+                                agent_id="worker",
+                                action_type=f"tool:{tool_name}",
+                                target=None,
+                                input_json=event.metadata.get("arguments", {}),
+                                result_json={"raw": (event.delta or "")[:500]},
+                                status="failed",
+                                error_text=(event.delta or "")[:1000],
+                            )
                         yield OrchestratedStreamEvent(
                             type="worker.status",
                             agent="worker",
@@ -883,9 +908,8 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                         continue
 
                     if event.type == "usage.update":
-                        state.turn_input_tokens += event.metadata.get("input_tokens", 0)
+                        state.turn_input_tokens = max(state.turn_input_tokens, event.metadata.get("input_tokens", 0))
                         state.turn_output_tokens += event.metadata.get("output_tokens", 0)
-                        state.turn_total_tokens += event.metadata.get("total_tokens", 0)
                         continue
 
                     if event.type == "runtime.tool_result":
@@ -901,6 +925,18 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                                 )
                             pending_text_chunks = []
                         tool_name = event.tool_call.name if event.tool_call is not None else "unknown"
+                        tool_ok = event.metadata.get("ok", True)
+                        if not tool_ok:
+                            self._record_runtime_action(
+                                task_id=state.task_id,
+                                agent_id="worker",
+                                action_type=f"tool:{tool_name}",
+                                target=None,
+                                input_json=event.metadata.get("arguments", {}),
+                                result_json={"raw": (event.delta or "")[:500]},
+                                status="failed",
+                                error_text=(event.delta or "")[:1000],
+                            )
                         yield OrchestratedStreamEvent(
                             type="worker.status",
                             agent="worker",
@@ -1225,9 +1261,13 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
 
     @staticmethod
     def _accumulate_usage(state: NeonRunState, run_result: AgentRunResult) -> None:
-        """Sum real API token usage from all provider runs into the turn-level accumulators."""
+        """Accumulate real API token usage from all provider runs into the turn-level accumulators.
+
+        input_tokens uses max (peak context window) because each API call's
+        input count already includes all prior messages.
+        output_tokens uses sum (total generation across all calls).
+        """
         for pr in run_result.provider_runs:
             u = pr.usage
-            state.turn_input_tokens += u.input_tokens or 0
+            state.turn_input_tokens = max(state.turn_input_tokens, u.input_tokens or 0)
             state.turn_output_tokens += u.output_tokens or 0
-            state.turn_total_tokens += u.total_tokens or 0

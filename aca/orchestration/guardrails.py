@@ -122,7 +122,7 @@ class GuardrailMixin:
             if not state.todo_written:
                 return f"{base}\nTask created. You may now do up to 2 orientation reads, then write todo.md."
             if todo_is_complete(state.todo_items):
-                return f"{base}\nTodo execution is complete. Synthesize the final answer now."
+                return f"{base}\nTodo execution is complete. Synthesize a concise final answer now (~200 lines max)."
             current = todo_in_progress(state.todo_items)
             if current is None:
                 return f"{base}\nTodo is ready. Start one todo item before continuing the analysis."
@@ -134,7 +134,7 @@ class GuardrailMixin:
                 return f"{base}\nPlan is ready. Write todo.md next."
             if not state.worker_spawned:
                 return f"{base}\nTodo is ready. Your next action must be spawn_analyze_worker."
-            return f"{base}\nThe worker has finished. Read findings.md and completion.json, then synthesize the final answer."
+            return f"{base}\nThe worker has finished. Read findings.md and completion.json, then write a concise synthesis (~200 lines max). Do NOT reproduce findings.md verbatim."
         if state.route == IMPLEMENT_ROUTE:
             if not state.plan_written:
                 return f"{base}\nTask created. You may now do up to 2 orientation reads, then write plan.md."
@@ -142,7 +142,7 @@ class GuardrailMixin:
                 return f"{base}\nPlan is ready. Write todo.md next."
             if not state.worker_spawned:
                 return f"{base}\nTodo is ready. Your next action must be spawn_implement_worker."
-            return f"{base}\nThe worker has finished. Read output.md and completion.json, then synthesize the final answer."
+            return f"{base}\nThe worker has finished. Read output.md and completion.json, then write a concise synthesis (~100 lines max). Do NOT reproduce output.md verbatim."
         return f"{base}\nUse the allowed workflow tools to recover the route."
 
     def _user_identity_instruction(self, state: NeonRunState) -> str:
@@ -184,7 +184,7 @@ class GuardrailMixin:
                 return f"{base}\n\nYour next step must be spawn_implement_worker."
             return f"{base}\n\nYour next step must be spawn_analyze_worker."
         if steering_code == STEERING_READ_FINDINGS:
-            return f"{base}\n\nYour next step must be read_task_artifact(findings.md) and read_task_artifact(completion.json)."
+            return f"{base}\n\nYour next step must be read_task_artifact(findings.md) and read_task_artifact(completion.json), then synthesize concisely (~200 lines max)."
         if steering_code == STEERING_READ_OUTPUT:
-            return f"{base}\n\nYour next step must be read_task_artifact(output.md) and read_task_artifact(completion.json)."
+            return f"{base}\n\nYour next step must be read_task_artifact(output.md) and read_task_artifact(completion.json), then synthesize concisely (~100 lines max)."
         return base

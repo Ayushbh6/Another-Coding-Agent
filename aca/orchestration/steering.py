@@ -15,6 +15,8 @@ from aca.orchestration.state import (
     STEERING_TODO_REQUIRED,
     STEERING_TODO_REVIEW,
     STEERING_WORKER_CONSOLIDATING,
+    STEERING_WORKER_WRITE_FINDINGS_NOW,
+    STEERING_WORKER_WRITE_OUTPUT_NOW,
 )
 
 
@@ -32,6 +34,8 @@ FRONTEND_STEERING_MESSAGES = {
     STEERING_READ_OUTPUT: "The implement worker has landed. Read `output.md` and `completion.json`, then synthesize the answer.",
     STEERING_WORKER_CONSOLIDATING: "The worker has enough evidence and is now stitching it into `findings.md`.",
     STEERING_IMPLEMENT_WORKER_CONSOLIDATING: "The implement worker has finished the todo and is now stitching the execution summary into `output.md`.",
+    STEERING_WORKER_WRITE_FINDINGS_NOW: "All todo items done. Worker must write `findings.md` now and stop.",
+    STEERING_WORKER_WRITE_OUTPUT_NOW: "All todo items done. Worker must write `output.md` now and stop.",
     STEERING_ROUTE_RECOVERY: "The current route is invalid for the task state. Re-anchor on the allowed workflow tools.",
 }
 

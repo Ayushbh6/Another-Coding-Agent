@@ -31,6 +31,8 @@ from aca.orchestration.state import (
     STEERING_TASK_REQUIRED_NOW,
     STEERING_TODO_ITEM_REQUIRED,
     STEERING_TODO_REQUIRED,
+    STEERING_WORKER_WRITE_FINDINGS_NOW,
+    STEERING_WORKER_WRITE_OUTPUT_NOW,
     AnalyzeWorkerState,
     ImplementWorkerState,
     NeonGuardrailError,
@@ -114,6 +116,25 @@ class OrchestrationToolRegistry:
         return self._steered_result(payload, code)
 
     def schemas(self) -> list[dict[str, Any]]:
+        # When the worker has finished all todos but hasn't written its artifact yet,
+        # lock down the tool surface to write_task_artifact only so the LLM can't go off-rail.
+        if self._worker_artifact_only_mode():
+            writable_artifacts = self._writable_artifact_names()
+            return [
+                tool_schema(
+                    "write_task_artifact",
+                    "Write an approved task artifact inside the active task workspace.",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "artifact_name": {"type": "string", "enum": writable_artifacts},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["artifact_name", "content"],
+                    },
+                )
+            ]
+
         tools: list[dict[str, Any]] = []
         if self._workspace_tools_available():
             tools.extend(self._read_registry.schemas(allow_mutation=self._workspace_mutations_available()))
@@ -271,12 +292,15 @@ class OrchestrationToolRegistry:
         return {name: handler for name, handler in all_handlers.items() if name in allowed_names}
 
     def list_files(self, *args, **kwargs) -> str:
+        self._reject_if_artifact_only("list_files")
         return self._run_repo_read(self._read_registry.list_files, *args, **kwargs)
 
     def read_file(self, *args, **kwargs) -> str:
+        self._reject_if_artifact_only("read_file")
         return self._run_repo_read(self._read_registry.read_file, *args, **kwargs)
 
     def search_code(self, *args, **kwargs) -> str:
+        self._reject_if_artifact_only("search_code")
         return self._run_repo_read(self._read_registry.search_code, *args, **kwargs)
 
     def write_file(self, *args, **kwargs) -> str:
@@ -466,6 +490,7 @@ class OrchestrationToolRegistry:
         return self._steered_result(payload, steering_code)
 
     def read_task_artifact(self, artifact_name: str) -> str:
+        self._reject_if_artifact_only("read_task_artifact")
         artifact_name = self._normalize_artifact_name(artifact_name)
         if self._actor == ACTOR_NEON and self._state.worker_requested and not self._state.worker_spawned:
             raise NeonGuardrailError(STEERING_SPAWN_WORKER_REQUIRED, "The delegated worker handoff has started. Stop polling artifacts.")
@@ -496,6 +521,7 @@ class OrchestrationToolRegistry:
         return json.dumps({"artifact_name": artifact_name, "path": path, "content": content})
 
     def read_todo_state(self) -> str:
+        self._reject_if_artifact_only("read_todo_state")
         self._ensure_todo_exists()
         payload = json.loads(self._todo.read_state())
         self._orchestrator._record_runtime_action(
@@ -509,6 +535,7 @@ class OrchestrationToolRegistry:
         return json.dumps(payload)
 
     def start_todo_item(self, todo_id: str) -> str:
+        self._reject_if_artifact_only("start_todo_item")
         self._ensure_not_waiting_for_worker()
         return self._promote_steering(self._todo.start(todo_id))
 
@@ -705,6 +732,18 @@ class OrchestrationToolRegistry:
                 return "Your next action must be write_task_artifact with artifact_name='output.md'."
             if steering_code == STEERING_READ_FINDINGS:
                 return "Your next action must be write_task_artifact with artifact_name='findings.md'."
+            if steering_code == STEERING_WORKER_WRITE_FINDINGS_NOW:
+                return (
+                    "STOP all other tool calls. All todo items are complete. "
+                    "Your ONLY remaining action is write_task_artifact with artifact_name='findings.md'. "
+                    "Do not call any other tool. Do not produce a summary. Write findings.md now and stop."
+                )
+            if steering_code == STEERING_WORKER_WRITE_OUTPUT_NOW:
+                return (
+                    "STOP all other tool calls. All todo items are complete. "
+                    "Your ONLY remaining action is write_task_artifact with artifact_name='output.md'. "
+                    "Do not call any other tool. Do not produce a summary. Write output.md now and stop."
+                )
             return "Follow the todo sequentially and keep the structured todo state up to date."
 
         state = self._state
@@ -794,6 +833,22 @@ class OrchestrationToolRegistry:
         assert isinstance(state, NeonRunState)
         return state.task_written
 
+    def _worker_artifact_only_mode(self) -> bool:
+        """True when the worker has finished all todos but hasn't written its artifact yet.
+
+        In this state we lock the tool surface to write_task_artifact only,
+        preventing the LLM from going off-rail with spurious tool calls.
+        """
+        if self._actor == ACTOR_ANALYZE_WORKER:
+            state = self._state
+            assert isinstance(state, AnalyzeWorkerState)
+            return todo_is_complete(state.todo_items) and not state.findings_written
+        if self._actor == ACTOR_IMPLEMENT_WORKER:
+            state = self._state
+            assert isinstance(state, ImplementWorkerState)
+            return todo_is_complete(state.todo_items) and not state.output_written
+        return False
+
     def _todo_tools_available(self) -> bool:
         if self._actor in {ACTOR_ANALYZE_WORKER, ACTOR_IMPLEMENT_WORKER}:
             return True
@@ -858,6 +913,23 @@ class OrchestrationToolRegistry:
     def _ensure_actor(self, actor: str) -> None:
         if self._actor != actor:
             raise NeonGuardrailError(STEERING_TASK_REQUIRED_NOW, f"{actor} tool used by the wrong actor.")
+
+    def _reject_if_artifact_only(self, tool_name: str) -> None:
+        """Raise if the worker must write its artifact and should not call any other tool."""
+        if not self._worker_artifact_only_mode():
+            return
+        if self._actor == ACTOR_ANALYZE_WORKER:
+            raise NeonGuardrailError(
+                STEERING_WORKER_WRITE_FINDINGS_NOW,
+                f"All todo items are done. Do not call {tool_name}. "
+                "Your only remaining action is write_task_artifact with artifact_name='findings.md'.",
+            )
+        if self._actor == ACTOR_IMPLEMENT_WORKER:
+            raise NeonGuardrailError(
+                STEERING_WORKER_WRITE_OUTPUT_NOW,
+                f"All todo items are done. Do not call {tool_name}. "
+                "Your only remaining action is write_task_artifact with artifact_name='output.md'.",
+            )
 
     def _ensure_todo_exists(self) -> None:
         if not self._state.task_id or not self._state.todo_items:

@@ -156,6 +156,14 @@ Runtime feedback is binding.
 - During task execution, narration is fine when it accompanies real tool use.
 - Do not try to answer the user early while the task is still in flight.
 - Final answers should be concise, technical, and grounded in the evidence you gathered.
+
+## RESPONSE LENGTH
+Your final answer to the user MUST be a concise synthesis, not a full dump of everything you found.
+- For chat replies: respond naturally, keep it short.
+- For analysis tasks: summarize the key findings in at most ~200 lines of markdown. Highlight the most important patterns and conclusions. Omit raw file listings, full code excerpts, and tool traces.
+- For implement tasks: summarize what was changed, why, and what to verify. At most ~100 lines.
+- If the user needs more detail, they can ask follow-up questions.
+- NEVER reproduce the entire contents of findings.md or output.md in your response. Synthesize, don't copy.
 """.strip()
 
 
@@ -210,6 +218,13 @@ You must not write:
    - `confidence_score`
 8. When the todo is fully done, write `findings.md`
 9. Stop
+
+## CRITICAL: AFTER ALL TODO ITEMS ARE DONE
+Once every todo item is completed or skipped:
+- Your ONLY remaining action is `write_task_artifact` with `artifact_name='findings.md'`.
+- Do NOT call any other tool — no `read_file`, no `list_files`, no `search_code`, no `read_task_artifact`, no todo tools.
+- Do NOT produce a text summary or explanation after writing `findings.md`.
+- Call `write_task_artifact` immediately, then stop. Nothing else.
 
 The todo tools are the source of truth for progress. Use them so completed or skipped items are reflected correctly in `todo.md` before you move on.
 
@@ -288,6 +303,13 @@ You must not write:
    - `confidence_score`
 8. When the todo is fully done, write `output.md`
 9. Stop
+
+## CRITICAL: AFTER ALL TODO ITEMS ARE DONE
+Once every todo item is completed or skipped:
+- Your ONLY remaining action is `write_task_artifact` with `artifact_name='output.md'`.
+- Do NOT call any other tool — no `read_file`, no `list_files`, no `search_code`, no `write_file`, no `edit_file`, no `run_command`, no todo tools.
+- Do NOT produce a text summary or explanation after writing `output.md`.
+- Call `write_task_artifact` immediately, then stop. Nothing else.
 
 The todo tools are the source of truth for progress. Keep the todo state accurate before moving on.
 

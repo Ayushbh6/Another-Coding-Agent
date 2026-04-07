@@ -5,7 +5,6 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.console import Group
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Confirm
@@ -326,46 +325,13 @@ class ChatCLIApp:
         spinner.start()
         active_streams: set[tuple[str, str]] = set()
         last_stream_type: str | None = None
-        live_markdown: Live | None = None
-        live_markdown_key: tuple[str, str] | None = None
-        live_markdown_buffer = ""
-
-        def stop_live_markdown() -> None:
-            nonlocal live_markdown, live_markdown_key, live_markdown_buffer
-            if live_markdown is not None:
-                live_markdown.stop()
-            live_markdown = None
-            live_markdown_key = None
-            live_markdown_buffer = ""
-
-        def render_markdown_stream(label: str, chunk: str) -> None:
-            nonlocal live_markdown, live_markdown_key, live_markdown_buffer
-            key = (label, "text")
-            if live_markdown_key != key:
-                stop_live_markdown()
-                header = Text()
-                header.append(label, style="bold magenta")
-                header.append("> ")
-                live_markdown_buffer = chunk
-                live_markdown = Live(
-                    Group(header, Markdown(live_markdown_buffer)),
-                    console=self.console,
-                    auto_refresh=False,
-                    vertical_overflow="visible",
-                    transient=False,
-                )
-                live_markdown.start()
-                live_markdown_key = key
-                live_markdown.refresh()
-                return
-            live_markdown_buffer += chunk
-            live_markdown.update(
-                Group(
-                    Text.assemble((label, "bold magenta"), ("> ", "")),
-                    Markdown(live_markdown_buffer),
-                ),
-                refresh=True,
-            )
+        
+        def stop_active_streams() -> None:
+            nonlocal last_stream_type
+            if last_stream_type in {"reasoning", "text"}:
+                self.console.print()
+            active_streams.clear()
+            last_stream_type = None
 
         def print_markdown_once(label: str, content: str) -> None:
             header = Text()
@@ -394,7 +360,6 @@ class ChatCLIApp:
 
                 if event.type == "reasoning.delta":
                     spinner.stop()
-                    stop_live_markdown()
                     label = event.agent or "agent"
                     if (label, "reasoning") not in active_streams:
                         if last_stream_type == "text":
@@ -411,41 +376,34 @@ class ChatCLIApp:
                     if (label, "text") not in active_streams:
                         if last_stream_type == "reasoning":
                             self.console.print()
+                        self.console.print(Text.assemble((label, "bold magenta"), ("> ", "")), end="")
                         active_streams.add((label, "text"))
                     for segment in self._iter_render_segments(event.text or ""):
-                        render_markdown_stream(label, segment)
+                        self.console.print(Text(segment, style=""), end="", highlight=False, soft_wrap=True)
                     last_stream_type = "text"
                     continue
 
                 if event.type == "worker.status":
                     # Show a compact tool-call indicator, then resume spinning
                     spinner.stop()
-                    stop_live_markdown()
-                    if last_stream_type in {"reasoning", "text"}:
-                        self.console.print()
+                    stop_active_streams()
                     self._print_tool_call_line(event.agent or "neon", event.message or "")
                     spinner.start()
-                    last_stream_type = None
                     continue
 
                 if event.type == "phase.completed":
-                    stop_live_markdown()
-                    if last_stream_type in {"reasoning", "text"}:
-                        spinner.stop()
-                        self.console.print()
+                    spinner.stop()
+                    stop_active_streams()
                     if event.message:
-                        spinner.stop()
                         self._print_agent_line(event.agent or "agent", event.message)
                         spinner.start()
-                    last_stream_type = None
                     continue
 
                 if event.type == "completed" and event.summary is not None:
                     spinner.stop()
-                    stop_live_markdown()
-                    if last_stream_type == "reasoning":
-                        self.console.print()
-                    if last_stream_type != "text":
+                    streamed_text = last_stream_type == "text"
+                    stop_active_streams()
+                    if not streamed_text:
                         print_markdown_once(event.agent or "assistant", event.final_answer or "")
                     self.console.print(
                         self._token_status(
@@ -456,15 +414,13 @@ class ChatCLIApp:
                     )
                     break
         except NeonGuardrailError:
-            stop_live_markdown()
             spinner.stop()
             self.console.print("[bold red]neon[/bold red]> I hit a workflow guardrail and could not recover cleanly. Please retry the request once.")
         except Exception as exc:
-            stop_live_markdown()
             spinner.stop()
             self.console.print(f"[bold red]aca[/bold red]> Unexpected error: {exc}")
         finally:
-            stop_live_markdown()
+            stop_active_streams()
             spinner.stop()
 
     def _print_agent_line(self, label: str, message: str) -> None:
