@@ -789,6 +789,43 @@ class FakeNeonProvider(LLMProvider):
             ),
         )
 
+    def _multi_tool_call_response(
+        self,
+        request: ProviderRequest,
+        tool_calls: list[ToolCall],
+        *,
+        response_id: str,
+        narration: str | None = None,
+    ) -> Iterator[ProviderEvent]:
+        if narration:
+            yield ProviderEvent(type="text.delta", delta=narration)
+        yield ProviderEvent(
+            type="response.completed",
+            result=RunResult(
+                provider=self.provider_name,
+                model=request.model,
+                assistant_message=Message(
+                    role="assistant",
+                    content=narration or "Need to use tools first.",
+                    tool_calls=tool_calls,
+                    reasoning="Use the tools first.",
+                    reasoning_details=[],
+                ),
+                reasoning="Use the tools first.",
+                reasoning_details=[],
+                text=narration or "Need to use tools first.",
+                structured_output=None,
+                tool_calls=tool_calls,
+                finish_reason="tool_calls",
+                usage=UsageStats(input_tokens=10, output_tokens=4, total_tokens=14),
+                response_id=response_id,
+                latency_ms=1.0,
+                provider_metadata={},
+                raw_response={},
+                raw_chunks=[],
+            ),
+        )
+
 
 class PrematureAnswerProvider(FakeNeonProvider):
     def __init__(self) -> None:
@@ -808,6 +845,242 @@ class PrematureAnswerProvider(FakeNeonProvider):
             yield from self._text_response(request, "Premature architectural explanation that should never be shown.", response_id="premature-1")
             return
         yield from super()._neon_response(request, full_user_text, tool_messages)
+
+
+class PretaskBoundaryProvider(FakeNeonProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stale_repo_tools_seen_after_scout = False
+
+    def _neon_response(self, request: ProviderRequest, full_user_text: str, tool_messages: list[Message]) -> Iterator[ProviderEvent]:
+        route = self._route_for_request(full_user_text)
+        if route != "analyze_delegated":
+            yield from super()._neon_response(request, full_user_text, tool_messages)
+            return
+
+        tool_names = [self._tool_name(message) for message in tool_messages]
+        tool_payloads = [self._tool_payload(message) for message in tool_messages]
+        written_artifacts = {
+            payload.get("artifact_name"): payload
+            for payload in tool_payloads
+            if isinstance(payload, dict) and payload.get("artifact_name")
+        }
+        spawn_scheduled = any(
+            isinstance(payload, dict) and payload.get("status") == "scheduled"
+            for payload in tool_payloads
+        )
+        system_prompt = next((str(message.content) for message in request.messages if message.role == "system"), "")
+        task_id = self._extract_task_id(system_prompt)
+        available_tool_names = {tool["function"]["name"] for tool in request.tools}
+
+        if not tool_messages:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(id="pretask-summary-1", name="get_repo_summary", arguments="{}"),
+                response_id="pretask-summary-1",
+                narration="I’m doing the scout pass first.",
+            )
+            return
+        if "list_files" not in tool_names:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(id="pretask-list-1", name="list_files", arguments='{"path":".","limit":20,"max_depth":2}'),
+                response_id="pretask-list-1",
+            )
+            return
+        if "read_file" not in tool_names:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(id="pretask-read-1", name="read_file", arguments='{"path":"README.md","start_line":1,"end_line":20}'),
+                response_id="pretask-read-1",
+            )
+            return
+        if "task.md" not in written_artifacts:
+            if {"list_files", "read_file", "search_code"} & available_tool_names:
+                self.stale_repo_tools_seen_after_scout = True
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="pretask-stale-1", name="search_code", arguments='{"pattern":"class NeonOrchestrator","path":"aca"}'),
+                    response_id="pretask-stale-1",
+                )
+                return
+            yield from self._tool_call_response(
+                request,
+                ToolCall(
+                    id="pretask-task-1",
+                    name="write_task_artifact",
+                    arguments=json.dumps(
+                        {
+                            "artifact_name": "task.md",
+                            "content": (
+                                "---\n"
+                                f"task_id: {task_id}\n"
+                                "intent: analyze\n"
+                                "route: analyze_delegated\n"
+                                "title: Scan the codebase\n"
+                                "---\n"
+                                "Scan the codebase and explain how the agent architecture works.\n"
+                            ),
+                        }
+                    ),
+                ),
+                response_id="pretask-task-1",
+            )
+            return
+        if "plan.md" not in written_artifacts:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(
+                    id="pretask-plan-1",
+                    name="write_task_artifact",
+                    arguments=json.dumps(
+                        {
+                            "artifact_name": "plan.md",
+                            "content": "# Plan\n\n1. Inspect the orchestrator.\n2. Inspect tool gating.\n3. Summarize the architecture.\n",
+                        }
+                    ),
+                ),
+                response_id="pretask-plan-1",
+            )
+            return
+        if "todo.md" not in written_artifacts:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(
+                    id="pretask-todo-1",
+                    name="write_task_artifact",
+                    arguments=json.dumps(
+                        {
+                            "artifact_name": "todo.md",
+                            "content": "- inspect the orchestrator stream path\n- inspect shared tool handling\n",
+                        }
+                    ),
+                ),
+                response_id="pretask-todo-1",
+            )
+            return
+        if not spawn_scheduled:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(id="pretask-spawn-1", name="spawn_analyze_worker", arguments="{}"),
+                response_id="pretask-spawn-1",
+            )
+            return
+        yield from super()._neon_response(request, full_user_text, tool_messages)
+
+
+class BundledWorkerBoundaryProvider(FakeNeonProvider):
+    def _worker_response(self, request: ProviderRequest, tool_messages: list[Message]) -> Iterator[ProviderEvent]:
+        tool_names = [self._tool_name(message) for message in tool_messages]
+        tool_payloads = [self._tool_payload(message) for message in tool_messages]
+        if "read_task_artifact" not in tool_names:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(id="worker-task-1", name="read_task_artifact", arguments='{"artifact_name":"task.md"}'),
+                response_id="worker-task-1",
+                narration="I have the handoff. Reading the task artifacts first.",
+            )
+            return
+        if tool_names.count("read_task_artifact") == 1:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(id="worker-plan-1", name="read_task_artifact", arguments='{"artifact_name":"plan.md"}'),
+                response_id="worker-plan-1",
+            )
+            return
+        if tool_names.count("read_task_artifact") == 2:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(id="worker-todo-1", name="read_task_artifact", arguments='{"artifact_name":"todo.md"}'),
+                response_id="worker-todo-1",
+            )
+            return
+        if "read_todo_state" not in tool_names:
+            yield from self._tool_call_response(
+                request,
+                ToolCall(id="worker-todo-state-1", name="read_todo_state", arguments="{}"),
+                response_id="worker-todo-state-1",
+            )
+            return
+        todo_payload = next(
+            (payload for payload in reversed(tool_payloads) if isinstance(payload, dict) and payload.get("items")),
+            None,
+        )
+        todo_items = todo_payload.get("items", []) if isinstance(todo_payload, dict) else []
+        started_ids = {str(payload.get("todo_id")) for payload in tool_payloads if isinstance(payload, dict) and payload.get("status") == "in_progress"}
+        completed_ids = {str(payload.get("todo_id")) for payload in tool_payloads if isinstance(payload, dict) and payload.get("status") == "completed"}
+        if todo_items:
+            first_id = str(todo_items[0]["todo_id"])
+            if first_id not in started_ids and first_id not in completed_ids:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="worker-start-1", name="start_todo_item", arguments=json.dumps({"todo_id": first_id})),
+                    response_id="worker-start-1",
+                )
+                return
+            if "search_code" not in tool_names:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="worker-search-1", name="search_code", arguments='{"pattern":"class NeonOrchestrator","path":"aca"}'),
+                    response_id="worker-search-1",
+                )
+                return
+            if first_id not in completed_ids:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(
+                        id="worker-complete-1",
+                        name="complete_todo_item",
+                        arguments=json.dumps({"todo_id": first_id, "outcome": "Traced the orchestrator stream path."}),
+                    ),
+                    response_id="worker-complete-1",
+                )
+                return
+        if len(todo_items) > 1:
+            second_id = str(todo_items[1]["todo_id"])
+            if second_id not in started_ids and second_id not in completed_ids:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="worker-start-2", name="start_todo_item", arguments=json.dumps({"todo_id": second_id})),
+                    response_id="worker-start-2",
+                )
+                return
+            if "read_file" not in tool_names:
+                yield from self._tool_call_response(
+                    request,
+                    ToolCall(id="worker-read-1", name="read_file", arguments='{"path":"aca/orchestration/tools.py","start_line":1,"end_line":260}'),
+                    response_id="worker-read-1",
+                )
+                return
+            if second_id not in completed_ids:
+                yield from self._multi_tool_call_response(
+                    request,
+                    [
+                        ToolCall(
+                            id="worker-complete-2",
+                            name="complete_todo_item",
+                            arguments=json.dumps({"todo_id": second_id, "outcome": "Traced the shared tool and todo handling."}),
+                        ),
+                        ToolCall(id="worker-list-after-complete", name="list_files", arguments='{"path":"aca","limit":10,"max_depth":1}'),
+                    ],
+                    response_id="worker-complete-bundled-1",
+                    narration="The todo is complete. I’m consolidating the findings now.",
+                )
+                return
+        yield from self._tool_call_response(
+            request,
+            ToolCall(
+                id="worker-findings-1",
+                name="write_task_artifact",
+                arguments=json.dumps(
+                    {
+                        "artifact_name": "findings.md",
+                        "content": "# Findings\n\nThe agent architecture centers on NeonOrchestrator, shared orchestration tools, and a delegated analyze worker.\n",
+                    }
+                ),
+            ),
+            response_id="worker-findings-1",
+        )
 
 
 class NeonOrchestratorTests(unittest.TestCase):
@@ -962,6 +1235,33 @@ class NeonOrchestratorTests(unittest.TestCase):
             ).all()
             self.assertTrue(any(action.action_type == "todo_item_started" for action in worker_actions))
             self.assertTrue(any(action.action_type == "todo_item_completed" for action in worker_actions))
+
+    def test_pretask_boundary_refreshes_tool_surface_before_task_creation(self) -> None:
+        provider = PretaskBoundaryProvider()
+        events = self._run(
+            "scan the codebase and tell me how the agent architecture works",
+            provider=provider,
+        )
+
+        completed = next(event for event in events if event.type == "completed")
+        self.assertEqual(completed.final_answer, "Delegated analysis summary.")
+        self.assertFalse(provider.stale_repo_tools_seen_after_scout)
+
+    def test_worker_boundary_restart_stops_bundled_tool_calls_after_final_todo(self) -> None:
+        events = self._run(
+            "scan the codebase and tell me how the agent architecture works",
+            provider=BundledWorkerBoundaryProvider(),
+        )
+
+        completed = next(event for event in events if event.type == "completed")
+        self.assertEqual(completed.final_answer, "Delegated analysis summary.")
+        task_dir = next((self.root / ".aca" / "tasks").iterdir())
+        self.assertTrue((task_dir / "findings.md").exists())
+        with self.storage.session_factory() as session:
+            worker_actions = session.scalars(
+                select(Action).where(Action.agent_id == "worker").order_by(Action.started_at.asc())
+            ).all()
+            self.assertFalse(any(action.action_type == "tool:list_files" for action in worker_actions))
 
     def test_premature_no_tool_answer_is_suppressed(self) -> None:
         """With heuristics removed, agent is trusted to answer directly even for

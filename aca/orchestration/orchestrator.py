@@ -38,10 +38,13 @@ from aca.orchestration.state import (
     STEERING_ORIENTATION_DELEGATED,
     STEERING_ORIENTATION_SIMPLE,
     STEERING_IMPLEMENT_WORKER_CONSOLIDATING,
+    STEERING_PRETASK_LIMIT_REACHED,
     STEERING_SPAWN_WORKER_REQUIRED,
     STEERING_TASK_REQUIRED_NOW,
     STEERING_TODO_ITEM_REQUIRED,
     STEERING_WORKER_CONSOLIDATING,
+    STEERING_WORKER_WRITE_FINDINGS_NOW,
+    STEERING_WORKER_WRITE_OUTPUT_NOW,
     AnalyzeWorkerState,
     ImplementWorkerState,
     NeonGuardrailError,
@@ -50,6 +53,7 @@ from aca.orchestration.state import (
 )
 from aca.orchestration.steering import steering_message
 from aca.orchestration.tools import OrchestrationToolRegistry
+from aca.orchestration.todo import todo_is_complete
 from aca.storage.models import (
     Conversation,
     MemoryEntry,
@@ -313,6 +317,8 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
             final_result: AgentRunResult | None = None
             handoff_requested = False
             boundary_restart_requested = False
+            boundary_steering_code: str | None = None
+            restart_with_phase_instruction = False
             pending_text_chunks: list[str] = []
             cycle_history_messages: list[Message] = []
             pending_text_phase = "route"
@@ -411,11 +417,18 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                     if tool_name in {"spawn_analyze_worker", "spawn_implement_worker"} and state.worker_requested and not state.worker_spawned:
                         handoff_requested = True
                         break
-                    if tool_name == "write_task_artifact" and steering_code in {
-                        STEERING_TODO_ITEM_REQUIRED,
-                        STEERING_SPAWN_WORKER_REQUIRED,
-                    }:
+                    if self._should_restart_neon_cycle(
+                        tool_name=tool_name,
+                        steering_code=steering_code,
+                        state=state,
+                    ):
                         boundary_restart_requested = True
+                        boundary_steering_code = steering_code
+                        restart_with_phase_instruction = steering_code in {
+                            STEERING_PRETASK_LIMIT_REACHED,
+                            STEERING_ORIENTATION_SIMPLE,
+                            STEERING_ORIENTATION_DELEGATED,
+                        }
                         break
                     continue
 
@@ -461,7 +474,10 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                 if callable(close):
                     close()
                 carryover_messages = [*carryover_messages, *cycle_history_messages]
-                correction_message = self._run_instructions(state)
+                if restart_with_phase_instruction and boundary_steering_code:
+                    correction_message = self._phase_restart_instruction(state, boundary_steering_code)
+                else:
+                    correction_message = self._run_instructions(state)
                 continue
 
             if final_result is None:
@@ -500,6 +516,25 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
             return None
         steering_code = payload.get("steering_code")
         return str(steering_code) if steering_code else None
+
+    @staticmethod
+    def _should_restart_neon_cycle(
+        *,
+        tool_name: str,
+        steering_code: str | None,
+        state: NeonRunState,
+    ) -> bool:
+        if steering_code in {
+            STEERING_PRETASK_LIMIT_REACHED,
+            STEERING_ORIENTATION_SIMPLE,
+            STEERING_ORIENTATION_DELEGATED,
+        }:
+            return True
+        if tool_name == "write_task_artifact":
+            return True
+        if tool_name in {"complete_todo_item", "skip_todo_item"} and state.route == ANALYZE_SIMPLE_ROUTE:
+            return todo_is_complete(state.todo_items)
+        return False
 
     def _ensure_task_created(self, state: NeonRunState, parsed: Any) -> str:
         if state.task_id is not None:
@@ -604,25 +639,6 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
             path_access_manager=self._path_access_manager,
         )
         read_registry = WorkspaceToolRegistry(context)
-        registry = OrchestrationToolRegistry(
-            orchestrator=self,
-            actor=ACTOR_ANALYZE_WORKER,
-            route=ANALYZE_DELEGATED_ROUTE,
-            state=worker_state,
-            workspace_manager=self._workspace_manager,
-            read_registry=read_registry,
-        )
-        worker = create_agent(
-            name="AnalyzeWorker",
-            model=state.model,
-            instructions=ANALYZE_WORKER_PROMPT,
-            provider=self._provider,
-            tools=registry.schemas(),
-            tool_registry=registry.handlers(),
-            max_turns=20,
-            reasoning_enabled=state.thinking_enabled,
-            history_mode=HistoryMode.DIALOGUE_ONLY,
-        )
         yield OrchestratedStreamEvent(
             type="phase.started",
             agent="worker",
@@ -641,16 +657,38 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
         )
         result: AgentRunResult | None = None
         for _attempt in range(3):
+            registry = OrchestrationToolRegistry(
+                orchestrator=self,
+                actor=ACTOR_ANALYZE_WORKER,
+                route=ANALYZE_DELEGATED_ROUTE,
+                state=worker_state,
+                workspace_manager=self._workspace_manager,
+                read_registry=read_registry,
+            )
+            worker = create_agent(
+                name="AnalyzeWorker",
+                model=state.model,
+                instructions=ANALYZE_WORKER_PROMPT,
+                provider=self._provider,
+                tools=registry.schemas(),
+                tool_registry=registry.handlers(),
+                max_turns=20,
+                reasoning_enabled=state.thinking_enabled,
+                history_mode=HistoryMode.DIALOGUE_ONLY,
+            )
             try:
                 final_result: AgentRunResult | None = None
+                boundary_restart_requested = False
                 pending_text_chunks: list[str] = []
-                for event in worker.stream(
+                cycle_history_messages: list[Message] = []
+                stream = worker.stream(
                     "Read task.md, plan.md, and todo.md. "
                     "Follow todo.md sequentially. "
                     "Write a dense, factual findings.md, then stop.",
                     carryover_messages=carryover_messages,
                     extra_instructions=extra_instructions,
-                ):
+                )
+                for event in stream:
                     if event.type == "text.delta":
                         pending_text_chunks.append(event.delta or "")
                         continue
@@ -684,6 +722,7 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                                 )
                             pending_text_chunks = []
                         tool_name = event.tool_call.name if event.tool_call is not None else "unknown"
+                        steering_code = self._steering_code_from_result(event.delta)
                         tool_ok = event.metadata.get("ok", True)
                         if not tool_ok:
                             self._record_runtime_action(
@@ -696,6 +735,22 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                                 status="failed",
                                 error_text=(event.delta or "")[:1000],
                             )
+                        if event.tool_call is not None:
+                            cycle_history_messages.append(
+                                Message(
+                                    role="assistant",
+                                    content=None,
+                                    tool_calls=[event.tool_call],
+                                )
+                            )
+                        cycle_history_messages.append(
+                            Message(
+                                role="tool",
+                                content=event.delta,
+                                tool_call_id=event.tool_call.id if event.tool_call is not None else None,
+                                metadata={"tool_name": tool_name},
+                            )
+                        )
                         yield OrchestratedStreamEvent(
                             type="worker.status",
                             agent="worker",
@@ -704,12 +759,41 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                             task_id=state.task_id,
                             message=self._summarize_tool_result(tool_name, event.delta),
                         )
+                        if steering_code == STEERING_WORKER_WRITE_FINDINGS_NOW:
+                            boundary_restart_requested = True
+                            break
+                        if tool_name == "write_task_artifact" and worker_state.findings_written:
+                            break
                         continue
 
                     if event.type == "run.completed" and isinstance(event.result, AgentRunResult):
                         final_result = event.result
 
-                if final_result is None:
+                if final_result is None and worker_state.findings_written:
+                    close = getattr(stream, "close", None)
+                    if callable(close):
+                        close()
+                if boundary_restart_requested:
+                    close = getattr(stream, "close", None)
+                    if callable(close):
+                        close()
+                    carryover_messages = [*carryover_messages, *cycle_history_messages]
+                    extra_instructions = (
+                        f"{self._user_identity_instruction(state)}\n"
+                        "Use what you already gathered. "
+                        "Do not continue broad exploration. "
+                        "Write findings.md now."
+                    )
+                    yield OrchestratedStreamEvent(
+                        type="worker.status",
+                        agent="worker",
+                        phase="delegated_analyze",
+                        conversation_id=conversation_id,
+                        task_id=state.task_id,
+                        message=steering_message(STEERING_WORKER_CONSOLIDATING),
+                    )
+                    continue
+                if final_result is None and not worker_state.findings_written:
                     raise RuntimeError("Analyze worker stream did not complete.")
                 if worker_state.findings_written and pending_text_chunks:
                     for chunk in pending_text_chunks:
@@ -756,7 +840,7 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                 message=steering_message(STEERING_WORKER_CONSOLIDATING),
             )
 
-        if result is None or not worker_state.findings_written:
+        if not worker_state.findings_written:
             summary = "Analyze worker finished without writing findings.md."
             self._write_completion_artifact(state, status="failed", worker_status="failed", worker_summary=summary)
             payload = {"status": "failed", "summary": summary, "findings_path": None}
@@ -791,7 +875,7 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
             state,
             status="worker_completed",
             worker_status="completed",
-            worker_summary=self._final_text_payload(result),
+            worker_summary=self._final_text_payload(result) if result is not None else "",
         )
         with self._session_factory.begin() as session:
             task = session.get(Task, state.task_id)
@@ -845,25 +929,6 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
             auto_approve_tools=frozenset({"write_file", "edit_file", "file_ops"}),
         )
         read_registry = WorkspaceToolRegistry(context)
-        registry = OrchestrationToolRegistry(
-            orchestrator=self,
-            actor=ACTOR_IMPLEMENT_WORKER,
-            route=IMPLEMENT_ROUTE,
-            state=worker_state,
-            workspace_manager=self._workspace_manager,
-            read_registry=read_registry,
-        )
-        worker = create_agent(
-            name="ImplementWorker",
-            model=state.model,
-            instructions=IMPLEMENT_WORKER_PROMPT,
-            provider=self._provider,
-            tools=registry.schemas(),
-            tool_registry=registry.handlers(),
-            max_turns=24,
-            reasoning_enabled=state.thinking_enabled,
-            history_mode=HistoryMode.DIALOGUE_ONLY,
-        )
         yield OrchestratedStreamEvent(
             type="phase.started",
             agent="worker",
@@ -882,16 +947,38 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
         )
         result: AgentRunResult | None = None
         for _attempt in range(3):
+            registry = OrchestrationToolRegistry(
+                orchestrator=self,
+                actor=ACTOR_IMPLEMENT_WORKER,
+                route=IMPLEMENT_ROUTE,
+                state=worker_state,
+                workspace_manager=self._workspace_manager,
+                read_registry=read_registry,
+            )
+            worker = create_agent(
+                name="ImplementWorker",
+                model=state.model,
+                instructions=IMPLEMENT_WORKER_PROMPT,
+                provider=self._provider,
+                tools=registry.schemas(),
+                tool_registry=registry.handlers(),
+                max_turns=24,
+                reasoning_enabled=state.thinking_enabled,
+                history_mode=HistoryMode.DIALOGUE_ONLY,
+            )
             try:
                 final_result: AgentRunResult | None = None
+                boundary_restart_requested = False
                 pending_text_chunks: list[str] = []
-                for event in worker.stream(
+                cycle_history_messages: list[Message] = []
+                stream = worker.stream(
                     "Read task.md, plan.md, and todo.md. "
                     "Follow todo.md sequentially. "
                     "Write a concise, factual output.md, then stop.",
                     carryover_messages=carryover_messages,
                     extra_instructions=extra_instructions,
-                ):
+                )
+                for event in stream:
                     if event.type == "text.delta":
                         pending_text_chunks.append(event.delta or "")
                         continue
@@ -925,6 +1012,7 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                                 )
                             pending_text_chunks = []
                         tool_name = event.tool_call.name if event.tool_call is not None else "unknown"
+                        steering_code = self._steering_code_from_result(event.delta)
                         tool_ok = event.metadata.get("ok", True)
                         if not tool_ok:
                             self._record_runtime_action(
@@ -937,6 +1025,22 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                                 status="failed",
                                 error_text=(event.delta or "")[:1000],
                             )
+                        if event.tool_call is not None:
+                            cycle_history_messages.append(
+                                Message(
+                                    role="assistant",
+                                    content=None,
+                                    tool_calls=[event.tool_call],
+                                )
+                            )
+                        cycle_history_messages.append(
+                            Message(
+                                role="tool",
+                                content=event.delta,
+                                tool_call_id=event.tool_call.id if event.tool_call is not None else None,
+                                metadata={"tool_name": tool_name},
+                            )
+                        )
                         yield OrchestratedStreamEvent(
                             type="worker.status",
                             agent="worker",
@@ -945,12 +1049,41 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                             task_id=state.task_id,
                             message=self._summarize_tool_result(tool_name, event.delta),
                         )
+                        if steering_code == STEERING_WORKER_WRITE_OUTPUT_NOW:
+                            boundary_restart_requested = True
+                            break
+                        if tool_name == "write_task_artifact" and worker_state.output_written:
+                            break
                         continue
 
                     if event.type == "run.completed" and isinstance(event.result, AgentRunResult):
                         final_result = event.result
 
-                if final_result is None:
+                if final_result is None and worker_state.output_written:
+                    close = getattr(stream, "close", None)
+                    if callable(close):
+                        close()
+                if boundary_restart_requested:
+                    close = getattr(stream, "close", None)
+                    if callable(close):
+                        close()
+                    carryover_messages = [*carryover_messages, *cycle_history_messages]
+                    extra_instructions = (
+                        f"{self._user_identity_instruction(state)}\n"
+                        "Use what you already changed. "
+                        "Do not continue broad exploration. "
+                        "Write output.md now."
+                    )
+                    yield OrchestratedStreamEvent(
+                        type="worker.status",
+                        agent="worker",
+                        phase="delegated_implement",
+                        conversation_id=conversation_id,
+                        task_id=state.task_id,
+                        message=steering_message(STEERING_IMPLEMENT_WORKER_CONSOLIDATING),
+                    )
+                    continue
+                if final_result is None and not worker_state.output_written:
                     raise RuntimeError("Implement worker stream did not complete.")
                 if worker_state.output_written and pending_text_chunks:
                     for chunk in pending_text_chunks:
@@ -997,7 +1130,7 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
                 message=steering_message(STEERING_IMPLEMENT_WORKER_CONSOLIDATING),
             )
 
-        if result is None or not worker_state.output_written:
+        if not worker_state.output_written:
             summary = "Implement worker finished without writing output.md."
             self._write_completion_artifact(state, status="failed", worker_status="failed", worker_summary=summary)
             payload = {"status": "failed", "summary": summary, "output_path": None}
@@ -1032,7 +1165,7 @@ class NeonOrchestrator(PersistenceMixin, HistoryMixin, GuardrailMixin):
             state,
             status="worker_completed",
             worker_status="completed",
-            worker_summary=self._final_text_payload(result),
+            worker_summary=self._final_text_payload(result) if result is not None else "",
         )
         with self._session_factory.begin() as session:
             task = session.get(Task, state.task_id)
