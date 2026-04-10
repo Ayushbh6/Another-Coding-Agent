@@ -11,3 +11,4 @@ data/
 !README.md
 !docs/
 !docs/*.md
+.archive-not-used/
