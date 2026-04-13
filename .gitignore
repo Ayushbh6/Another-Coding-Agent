@@ -7,6 +7,9 @@ node_modules/
 venv/
 __pycache__/
 data/
+*.egg-info/
+dist/
+build/
 *.md
 !README.md
 !docs/

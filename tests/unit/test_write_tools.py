@@ -54,14 +54,25 @@ class TestWriteFile:
         with pytest.raises(ValueError, match="sensitive"):
             write_file(".env", "SECRET=123", repo_root=str(repo))
 
+    def test_overwrite_false_fails_if_exists(self, repo):
+        (repo / "existing.py").write_text("old\n")
+        with pytest.raises(FileExistsError, match="already exists"):
+            write_file("existing.py", "new\n", repo_root=str(repo), overwrite=False)
 
-# ── create_file ───────────────────────────────────────────────────────────────
+    def test_overwrite_false_creates_new_file(self, repo):
+        result = write_file("brand_new.py", "# new\n", repo_root=str(repo), overwrite=False)
+        assert result["action"] == "created"
+        assert (repo / "brand_new.py").read_text() == "# new\n"
+
+
+# ── create_file (alias for write_file overwrite=False) ────────────────────────
 
 class TestCreateFile:
     def test_creates_file(self, repo):
         result = create_file("brand_new.py", "# new\n", repo_root=str(repo))
         assert (repo / "brand_new.py").read_text() == "# new\n"
         assert result["bytes_written"] > 0
+        assert result["action"] == "created"
 
     def test_fails_if_file_exists(self, repo):
         (repo / "existing.py").write_text("old\n")
@@ -252,3 +263,49 @@ class TestDeleteFile:
         (aca / "task.md").write_text("# Task")
         with pytest.raises(ValueError, match=".aca"):
             delete_file(".aca/active/task-001/task.md", repo_root=str(repo))
+
+
+# ── example_guidelines write guard ───────────────────────────────────────────
+
+from pathlib import Path as _Path
+
+_GLOBAL_EG = str(_Path.home() / ".aca" / "example_guidelines")
+
+
+class TestExampleGuidelinesWriteGuard:
+    """
+    All write tools must hard-block any path inside ~/.aca/example_guidelines/.
+    Tests use absolute paths since that's the real global location now.
+    """
+
+    def test_write_file_blocks_global_example_guidelines(self, repo):
+        with pytest.raises(ValueError, match="example_guidelines"):
+            write_file(
+                f"{_GLOBAL_EG}/task.md",
+                "hacked",
+                repo_root=str(repo),
+            )
+
+    def test_write_file_blocks_new_file_in_global_guidelines(self, repo):
+        with pytest.raises(ValueError, match="example_guidelines"):
+            write_file(
+                f"{_GLOBAL_EG}/new.md",
+                "# new",
+                repo_root=str(repo),
+            )
+
+    def test_update_file_blocks_global_example_guidelines(self, repo):
+        with pytest.raises(ValueError, match="example_guidelines"):
+            update_file(
+                f"{_GLOBAL_EG}/task.md",
+                old_string="# Example",
+                new_string="# hacked",
+                repo_root=str(repo),
+            )
+
+    def test_delete_file_blocks_global_example_guidelines(self, repo):
+        with pytest.raises(ValueError, match="example_guidelines"):
+            delete_file(
+                f"{_GLOBAL_EG}/task.md",
+                repo_root=str(repo),
+            )

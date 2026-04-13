@@ -9,7 +9,6 @@ import pytest
 
 from aca.tools.read import (
     get_file_outline,
-    get_repo_summary,
     list_files,
     read_file,
     search_repo,
@@ -269,42 +268,3 @@ class TestGetFileOutline:
     def test_file_not_found(self, repo):
         with pytest.raises(FileNotFoundError):
             get_file_outline("missing.py", repo_root=str(repo))
-
-
-# ── get_repo_summary ──────────────────────────────────────────────────────────
-
-class TestGetRepoSummary:
-    def test_top_level_structure_present(self, repo):
-        (repo / "README.md").write_text("# hi")
-        (repo / "src").mkdir()
-        result = get_repo_summary(repo_root=str(repo))
-        names = [e["name"] for e in result["top_level_structure"]]
-        assert "README.md" in names
-        assert "src" in names
-
-    def test_hidden_dirs_excluded(self, repo):
-        result = get_repo_summary(repo_root=str(repo))
-        names = [e["name"] for e in result["top_level_structure"]]
-        assert not any(n.startswith(".") for n in names)
-
-    def test_key_files_detected(self, repo):
-        (repo / "README.md").write_text("hi")
-        (repo / "requirements.txt").write_text("openai")
-        result = get_repo_summary(repo_root=str(repo))
-        assert "README.md" in result["key_files_present"]
-        assert "requirements.txt" in result["key_files_present"]
-
-    def test_language_breakdown(self, repo):
-        (repo / "a.py").write_text("x")
-        (repo / "b.py").write_text("x")
-        (repo / "c.md").write_text("x")
-        result = get_repo_summary(repo_root=str(repo))
-        exts = [e["ext"] for e in result["top_languages"]]
-        assert ".py" in exts
-
-    def test_git_status_returned(self, repo):
-        result = get_repo_summary(repo_root=str(repo))
-        assert "git_status" in result
-        # git may not be available in the test environment; either way a string is returned
-        assert isinstance(result["git_status"], str)
-        assert len(result["git_status"]) > 0

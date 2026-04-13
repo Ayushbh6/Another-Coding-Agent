@@ -355,11 +355,68 @@ _FN_MAP = {
 
 
 def register(registry: ToolRegistry) -> None:
-    """Register all memory tools into the given ToolRegistry."""
+    """Register all memory tools into the given ToolRegistry.
+
+    compact_context is registered as ToolCategory.SYSTEM so it is never
+    included in agent-visible schemas from get_schemas(). Context compaction
+    is triggered by BaseAgent during the compaction phase when
+    the token threshold is exceeded — agents must not call it manually.
+
+    search_memory is registered as ToolCategory.MEMORY and is available in
+    all permission modes.
+    """
     for schema in _SCHEMAS:
         name = schema["function"]["name"]
+        category = (
+            ToolCategory.SYSTEM
+            if name == "compact_context"
+            else ToolCategory.MEMORY
+        )
         registry.register(ToolDefinition(
             fn=_FN_MAP[name],
             schema=schema,
-            category=ToolCategory.MEMORY,
+            category=category,
         ))
+
+
+# ── Agent-facing schema for compaction phase ──────────────────────────────────
+
+def get_compact_context_agent_schema() -> dict:
+    """
+    Return the simplified tool schema exposed to the agent during the compaction
+    phase.  The agent only needs to specify *which* past Q&A pairs to evict;
+    all infrastructure fields (session_id, turn_id, agent, token counts) are
+    filled in by BaseAgent._execute_compact_context().
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "compact_context",
+            "description": (
+                "Remove selected past Q&A pairs from your active context to bring "
+                "token usage back within the safe operating range.  "
+                "You MUST call this tool now — it is the only tool available until "
+                "compaction is complete.  "
+                "Choose pairs whose content you no longer need for the current task.  "
+                "You may NOT remove pairs from the current turn.  "
+                "Pairs are removed in whole (both user message and assistant response "
+                "together).  Target: reduce context to ≤40 % of the threshold."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "compacted_turn_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "List of turn_ids for the past Q&A pairs you are evicting.  "
+                            "Must be a non-empty list of strings taken from the inventory "
+                            "shown in the steering message."
+                        ),
+                    },
+                },
+                "required": ["compacted_turn_ids"],
+                "additionalProperties": False,
+            },
+        },
+    }

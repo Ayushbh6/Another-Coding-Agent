@@ -20,6 +20,37 @@ from pathlib import Path
 from aca.tools.registry import ToolCategory, ToolDefinition, ToolRegistry
 
 
+# ── Hard-excluded directory names ────────────────────────────────────────────────────
+#
+# These directories are ALWAYS excluded from list_files, regardless of
+# .gitignore.  They are never useful for an LLM to traverse and are often
+# enormous (tokens, binaries, compiled artefacts).
+#
+# Inspired by OpenCode (ignoreNested set) and Claude Code (static exclusion).
+_ALWAYS_EXCLUDE_DIRS: frozenset[str] = frozenset({
+    # Python
+    ".venv", "venv", "env", ".env",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".tox", ".nox", "*.egg-info", ".eggs",
+    "htmlcov", ".coverage",
+    # Node / JS
+    "node_modules", ".pnp", ".yarn",
+    "dist", "build", ".next", ".nuxt", ".svelte-kit",
+    ".cache", ".parcel-cache", ".turbo",
+    # Rust
+    "target",
+    # Java / JVM
+    "out", ".gradle", ".mvn",
+    # Version control / IDE
+    ".git", ".hg", ".svn",
+    ".idea", ".vscode", ".vs",
+    # Misc build/vendor
+    "vendor", "_build", "buck-out",
+    # OS
+    ".DS_Store",
+})
+
+
 # ── Safety helpers ────────────────────────────────────────────────────────────
 
 _BLOCKED_PATH_FRAGMENTS = [
@@ -47,20 +78,56 @@ def _is_sensitive_path(path: Path) -> bool:
     return False
 
 
+def _global_aca_dir() -> Path:
+    """Return the resolved path to ~/.aca/."""
+    return Path.home() / ".aca"
+
+
+def _is_global_guidelines_path(target: Path) -> bool:
+    """Return True if target resolves inside ~/.aca/example_guidelines/."""
+    eg_dir = (_global_aca_dir() / "example_guidelines").resolve()
+    try:
+        target.resolve().relative_to(eg_dir)
+        return True
+    except ValueError:
+        return False
+
+
 def _resolve_and_guard(path_str: str, repo_root: Path) -> Path:
     """
     Resolve a path relative to repo_root, enforce repo boundary,
     and reject sensitive paths.
 
+    Narrow exception: absolute paths that resolve inside
+    ~/.aca/example_guidelines/ are allowed through — they are the global
+    read-only format reference files, accessible from any repo.
+
     Raises ValueError for any violation so the LLM receives a clear error.
     """
-    target = (repo_root / path_str).resolve()
+    # Allow absolute paths directly (e.g. /Users/foo/.aca/example_guidelines/task.md)
+    p = Path(path_str)
+    if p.is_absolute():
+        target = p.resolve()
+    else:
+        target = (repo_root / path_str).resolve()
+
+    # Narrow exception: global ~/.aca/example_guidelines/ bypasses repo boundary
+    if _is_global_guidelines_path(target):
+        # Still block sensitive patterns just in case
+        if _is_sensitive_path(target):
+            raise ValueError(
+                f"Path '{path_str}' matches a sensitive file pattern. "
+                "Reading secrets/credentials is blocked."
+            )
+        return target
+
     try:
         target.relative_to(repo_root.resolve())
     except ValueError:
         raise ValueError(
             f"Path '{path_str}' escapes the repo root. "
-            "ACA only reads files inside the current repository."
+            "ACA only reads files inside the current repository "
+            "or from ~/.aca/example_guidelines/."
         )
     if _is_sensitive_path(target):
         raise ValueError(
@@ -131,8 +198,15 @@ def read_file(
     slice_lines = all_lines[s:e]
     content = "".join(slice_lines)
 
+    # For files outside the repo root (e.g. global ~/.aca/example_guidelines/),
+    # relative_to would fail — use the absolute path string instead.
+    try:
+        display_path = str(target.relative_to(root))
+    except ValueError:
+        display_path = str(target)
+
     return {
-        "path": str(target.relative_to(root)),
+        "path": display_path,
         "content": content,
         "start_line": s + 1,
         "end_line": s + len(slice_lines),
@@ -140,6 +214,36 @@ def read_file(
         "total_lines": total_lines,
         "truncated": (s + len(slice_lines)) < total_lines,
     }
+
+
+def _batch_gitignored(paths: list[Path], repo_root: Path) -> set[str]:
+    """
+    Ask git which of the given paths are gitignored, in a single subprocess call.
+
+    Uses ``git check-ignore --stdin`` for efficiency (one process, N paths).
+    Returns a set of absolute path strings that are gitignored.
+    Falls back to empty set if git is unavailable or repo has no .git.
+    """
+    if not paths:
+        return set()
+    try:
+        stdin_data = "\n".join(str(p) for p in paths)
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "check-ignore", "--stdin"],
+            input=stdin_data,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        # check-ignore outputs the paths that ARE ignored (one per line)
+        ignored = set()
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line:
+                ignored.add(str(Path(line).resolve()))
+        return ignored
+    except Exception:  # noqa: BLE001
+        return set()  # fail open
 
 
 def list_files(
@@ -163,34 +267,48 @@ def list_files(
     if not target.is_dir():
         raise ValueError(f"'{path}' is a file, not a directory.")
 
-    entries = []
+    # Collect all candidate paths first so we can batch-check gitignore.
+    candidates: list[Path] = []
 
-    def _walk(directory: Path, current_depth: int) -> None:
+    def _collect(directory: Path, current_depth: int) -> None:
         try:
             children = sorted(directory.iterdir())
         except PermissionError:
             return
         for item in children:
+            # Always-exclude: junk dirs that are never useful to an LLM
+            if item.is_dir() and item.name in _ALWAYS_EXCLUDE_DIRS:
+                continue
+            # Hidden files/dirs (unless the caller explicitly asked for them)
             if not include_hidden and item.name.startswith("."):
                 continue
-            # Safety: skip sensitive paths silently
+            # Safety: skip paths that escape repo root or match sensitive patterns
             try:
                 _resolve_and_guard(str(item.relative_to(root)), root)
             except ValueError:
                 continue
-            # Pattern filter — only applied to files, not dirs
-            if pattern and item.is_file():
-                if not item.match(pattern):
-                    continue
-            entries.append({
-                "name": str(item.relative_to(root)),
-                "type": "file" if item.is_file() else "dir",
-                "size_bytes": item.stat().st_size if item.is_file() else None,
-            })
+            candidates.append(item)
             if item.is_dir() and current_depth < max_depth:
-                _walk(item, current_depth + 1)
+                _collect(item, current_depth + 1)
 
-    _walk(target, 1)
+    _collect(target, 1)
+
+    # Batch gitignore check — one subprocess call for all candidates
+    gitignored = _batch_gitignored(candidates, root)
+
+    entries = []
+    for item in candidates:
+        abs_str = str(item.resolve())
+        if abs_str in gitignored:
+            continue  # silently skip gitignored entries
+        # Pattern filter — only applied to files
+        if pattern and item.is_file() and not item.match(pattern):
+            continue
+        entries.append({
+            "name": str(item.relative_to(root)),
+            "type": "file" if item.is_file() else "dir",
+            "size_bytes": item.stat().st_size if item.is_file() else None,
+        })
 
     return {
         "path": str(target.relative_to(root)),
@@ -457,61 +575,6 @@ def get_file_outline(path: str, repo_root: str = ".") -> dict:
     }
 
 
-def get_repo_summary(repo_root: str = ".") -> dict:
-    """
-    Return a high-level snapshot of the repo: top-level structure,
-    git status summary, primary languages, and key config files found.
-    """
-    root = Path(repo_root).resolve()
-
-    # Top-level entries (non-hidden, max depth=1)
-    top_entries = []
-    for item in sorted(root.iterdir()):
-        if item.name.startswith("."):
-            continue
-        top_entries.append({
-            "name": item.name,
-            "type": "file" if item.is_file() else "dir",
-        })
-
-    # Git status
-    git_status: str | None = None
-    try:
-        gs = subprocess.run(
-            ["git", "-C", str(root), "status", "--short"],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-        git_status = gs.stdout.strip() or "(clean)"
-    except Exception:  # noqa: BLE001
-        git_status = "(git not available)"
-
-    # Language breakdown via extension count
-    lang_counts: dict[str, int] = {}
-    for item in root.rglob("*"):
-        if any(p.startswith(".") for p in item.parts):
-            continue
-        if item.is_file() and item.suffix:
-            ext = item.suffix.lower()
-            lang_counts[ext] = lang_counts.get(ext, 0) + 1
-    top_langs = sorted(lang_counts.items(), key=lambda x: -x[1])[:10]
-
-    # Key config files
-    key_file_names = [
-        "README.md", "pyproject.toml", "setup.py", "setup.cfg",
-        "requirements.txt", "package.json", "Makefile", "Dockerfile",
-        ".env.example", "docker-compose.yml", "MEMORY.md",
-    ]
-    found_key_files = [f for f in key_file_names if (root / f).exists()]
-
-    return {
-        "repo_root": str(root),
-        "top_level_structure": top_entries,
-        "git_status": git_status,
-        "top_languages": [{"ext": ext, "file_count": count} for ext, count in top_langs],
-        "key_files_present": found_key_files,
-    }
-
-
 # ── Schema definitions ────────────────────────────────────────────────────────
 
 _SCHEMAS: list[dict] = [
@@ -661,28 +724,6 @@ _SCHEMAS: list[dict] = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_repo_summary",
-            "description": (
-                "Get a high-level snapshot of the repo: top-level structure, git status, "
-                "primary languages by file count, and key config files present. "
-                "Use this at the start of a task to orient quickly."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "repo_root": {
-                        "type": "string",
-                        "description": "Absolute path to the repo root.",
-                    },
-                },
-                "required": [],
-                "additionalProperties": False,
-            },
-        },
-    },
 ]
 
 
@@ -693,7 +734,6 @@ _FN_MAP = {
     "list_files": list_files,
     "search_repo": search_repo,
     "get_file_outline": get_file_outline,
-    "get_repo_summary": get_repo_summary,
 }
 
 

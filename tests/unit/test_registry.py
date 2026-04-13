@@ -238,3 +238,106 @@ class TestToToolMessage:
         assert msg["role"] == "tool"
         parsed = json.loads(msg["content"])
         assert "error" in parsed
+
+
+# ── example_guidelines read guard (via registry.dispatch) ────────────────────
+
+import pytest
+from pathlib import Path as _Path
+from aca.tools import read as read_module
+
+_GLOBAL_EG = _Path.home() / ".aca" / "example_guidelines"
+
+
+def _make_registry_with_read_file():
+    """Build a minimal registry containing only the real read_file tool."""
+    registry = ToolRegistry()
+    read_module.register(registry)
+    return registry
+
+
+class TestExampleGuidelinesReadGuard:
+    """
+    The registry blocks read_file calls into ~/.aca/example_guidelines/ based
+    on the calling agent. James: task/plan/todo. Worker: findings/output.
+    All others: nothing.
+
+    Tests use the real global path (files already live there after install).
+    """
+
+    def _dispatch_read(self, registry, filename, agent):
+        path = str(_GLOBAL_EG / filename)
+        tc = _make_tool_call("read_file", {"path": path, "repo_root": "."})
+        return registry.dispatch(tc, mode=PermissionMode.READ, agent=agent)
+
+    # ── James permitted files ─────────────────────────────────────────────────
+
+    def test_james_can_read_task_md(self):
+        result = self._dispatch_read(_make_registry_with_read_file(), "task.md", "james")
+        assert result.success, result.error
+
+    def test_james_can_read_plan_md(self):
+        result = self._dispatch_read(_make_registry_with_read_file(), "plan.md", "james")
+        assert result.success, result.error
+
+    def test_james_can_read_todo_md(self):
+        result = self._dispatch_read(_make_registry_with_read_file(), "todo.md", "james")
+        assert result.success, result.error
+
+    # ── James blocked files ───────────────────────────────────────────────────
+
+    def test_james_cannot_read_findings_md(self):
+        result = self._dispatch_read(_make_registry_with_read_file(), "findings.md", "james")
+        assert not result.success
+        assert "example_guidelines" in (result.error or "") or "not permitted" in (result.error or "")
+
+    def test_james_cannot_read_output_md(self):
+        result = self._dispatch_read(_make_registry_with_read_file(), "output.md", "james")
+        assert not result.success
+
+    # ── Worker permitted files ────────────────────────────────────────────────
+
+    def test_worker_can_read_findings_md(self):
+        result = self._dispatch_read(_make_registry_with_read_file(), "findings.md", "worker")
+        assert result.success, result.error
+
+    def test_worker_can_read_output_md(self):
+        result = self._dispatch_read(_make_registry_with_read_file(), "output.md", "worker")
+        assert result.success, result.error
+
+    # ── Worker blocked files ──────────────────────────────────────────────────
+
+    def test_worker_cannot_read_task_md(self):
+        result = self._dispatch_read(_make_registry_with_read_file(), "task.md", "worker")
+        assert not result.success
+
+    def test_worker_cannot_read_plan_md(self):
+        result = self._dispatch_read(_make_registry_with_read_file(), "plan.md", "worker")
+        assert not result.success
+
+    # ── Unknown agents / challenger ───────────────────────────────────────────
+
+    def test_challenger_cannot_read_any_guidelines(self):
+        result = self._dispatch_read(_make_registry_with_read_file(), "task.md", "challenger")
+        assert not result.success
+        assert "reserved" in (result.error or "") or "not permitted" in (result.error or "")
+
+    def test_unknown_agent_cannot_read_guidelines(self):
+        result = self._dispatch_read(_make_registry_with_read_file(), "task.md", "unknown_bot")
+        assert not result.success
+
+    def test_no_agent_cannot_read_guidelines(self):
+        path = str(_GLOBAL_EG / "task.md")
+        tc = _make_tool_call("read_file", {"path": path, "repo_root": "."})
+        result = _make_registry_with_read_file().dispatch(tc, mode=PermissionMode.READ, agent=None)
+        assert not result.success
+
+    # ── Normal files outside guidelines are unaffected ────────────────────────
+
+    def test_normal_read_unaffected_by_guard(self, tmp_path):
+        (tmp_path / "hello.txt").write_text("hi\n")
+        tc = _make_tool_call(
+            "read_file", {"path": "hello.txt", "repo_root": str(tmp_path)}
+        )
+        result = _make_registry_with_read_file().dispatch(tc, mode=PermissionMode.READ, agent=None)
+        assert result.success

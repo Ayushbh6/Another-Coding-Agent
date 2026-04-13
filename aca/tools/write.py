@@ -21,12 +21,13 @@ from pathlib import Path
 import whatthepatch
 
 from aca.tools.registry import ToolCategory, ToolDefinition, ToolRegistry
-from aca.tools.read import _is_sensitive_path, _resolve_and_guard
+from aca.tools.read import _global_aca_dir, _is_sensitive_path, _resolve_and_guard
 
 
 # ── Safety helpers ────────────────────────────────────────────────────────────
 
 _ACA_WORKSPACE_DIR = ".aca"
+_EXAMPLE_GUIDELINES_DIR = ".aca/example_guidelines"
 
 
 def _guard_write_path(path_str: str, repo_root: Path) -> Path:
@@ -34,11 +35,38 @@ def _guard_write_path(path_str: str, repo_root: Path) -> Path:
     Resolve and validate a write target.
 
     Raises ValueError if:
+      - path resolves into ~/.aca/example_guidelines/ (global read-only templates)
+      - path is inside repo-local .aca/example_guidelines/
+      - path is inside repo .aca/ (workspace tools own that)
       - path escapes repo root
-      - path is inside .aca/ (workspace tools own that)
       - path matches a sensitive file pattern
     """
     target = _resolve_and_guard(path_str, repo_root)
+
+    # Block global ~/.aca/example_guidelines/ — checked first so the error is specific
+    global_eg = (_global_aca_dir() / "example_guidelines").resolve()
+    try:
+        target.relative_to(global_eg)
+        raise ValueError(
+            f"Path '{path_str}' resolves into '~/.aca/example_guidelines/' which is "
+            "read-only. These files are global format reference templates and must "
+            "never be modified."
+        )
+    except ValueError as exc:
+        if "read-only" in str(exc):
+            raise
+
+    # Hard-block repo-local example_guidelines/ (belt-and-suspenders)
+    eg_dir = (repo_root / _EXAMPLE_GUIDELINES_DIR).resolve()
+    try:
+        target.relative_to(eg_dir)
+        raise ValueError(
+            f"Path '{path_str}' is inside '.aca/example_guidelines/' which is read-only. "
+            "These files are format reference templates and must never be modified."
+        )
+    except ValueError as exc:
+        if "read-only" in str(exc):
+            raise
 
     aca_dir = (repo_root / _ACA_WORKSPACE_DIR).resolve()
     try:
@@ -60,9 +88,13 @@ def _guard_write_path(path_str: str, repo_root: Path) -> Path:
 
 # ── Tool implementations ──────────────────────────────────────────────────────
 
-def write_file(path: str, content: str, repo_root: str = ".") -> dict:
+def write_file(path: str, content: str, repo_root: str = ".", overwrite: bool = True) -> dict:
     """
-    Overwrite a file with new content. Creates the file if it does not exist.
+    Write content to a file inside the repo.
+
+    - overwrite=True (default): create or overwrite the file unconditionally.
+    - overwrite=False: create the file; raise FileExistsError if it already exists.
+
     Creates parent directories as needed.
 
     Returns {"path": str, "bytes_written": int, "action": "created"|"overwritten"}
@@ -71,6 +103,11 @@ def write_file(path: str, content: str, repo_root: str = ".") -> dict:
     target = _guard_write_path(path, root)
 
     existed = target.exists()
+    if existed and not overwrite:
+        raise FileExistsError(
+            f"File '{path}' already exists. Set overwrite=true to replace it."
+        )
+
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
 
@@ -82,25 +119,8 @@ def write_file(path: str, content: str, repo_root: str = ".") -> dict:
 
 
 def create_file(path: str, content: str, repo_root: str = ".") -> dict:
-    """
-    Create a new file. Fails if the file already exists.
-
-    Returns {"path": str, "bytes_written": int}
-    """
-    root = Path(repo_root).resolve()
-    target = _guard_write_path(path, root)
-
-    if target.exists():
-        raise FileExistsError(
-            f"File '{path}' already exists. Use write_file to overwrite."
-        )
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-
-    return {
-        "path": str(target.relative_to(root)),
-        "bytes_written": len(content.encode("utf-8")),
-    }
+    """Alias kept for backwards-compat with existing tests; delegates to write_file."""
+    return write_file(path=path, content=content, repo_root=repo_root, overwrite=False)
 
 
 def update_file(path: str, old_string: str, new_string: str, repo_root: str = ".") -> dict:
@@ -299,8 +319,9 @@ _SCHEMAS: list[dict] = [
         "function": {
             "name": "write_file",
             "description": (
-                "Overwrite a file with entirely new content, or create it if it does not exist. "
-                "Best for new files or complete rewrites. "
+                "Write content to a file inside the repo. "
+                "Set overwrite=false to create a new file and fail if it already exists. "
+                "Set overwrite=true (default) to create or unconditionally replace the file. "
                 "For targeted edits to existing files, prefer update_file or multi_update_file. "
                 "Cannot write into .aca/. Requires EDIT or FULL permission mode."
             ),
@@ -313,41 +334,18 @@ _SCHEMAS: list[dict] = [
                     },
                     "content": {
                         "type": "string",
-                        "description": "The full new content to write to the file.",
+                        "description": "The full content to write to the file.",
                     },
                     "repo_root": {
                         "type": "string",
                         "description": "Absolute path to the repo root.",
                     },
-                },
-                "required": ["path", "content"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_file",
-            "description": (
-                "Create a new file. Fails if the file already exists — use write_file to overwrite. "
-                "Creates parent directories as needed. "
-                "Cannot write into .aca/. Requires EDIT or FULL permission mode."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path to the new file from repo root.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The content to write to the new file.",
-                    },
-                    "repo_root": {
-                        "type": "string",
-                        "description": "Absolute path to the repo root.",
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": (
+                            "If true (default), create or overwrite. "
+                            "If false, fail with an error if the file already exists."
+                        ),
                     },
                 },
                 "required": ["path", "content"],
@@ -503,7 +501,6 @@ _SCHEMAS: list[dict] = [
 
 _FN_MAP = {
     "write_file": write_file,
-    "create_file": create_file,
     "update_file": update_file,
     "multi_update_file": multi_update_file,
     "apply_patch": apply_patch,
