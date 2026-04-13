@@ -256,6 +256,7 @@ class WorkerAgent(BaseAgent):
         session_id: str | None = None,
         console: Any = None,
         context_token_threshold: int = 120_000,
+        repo_root: str = ".",
     ) -> None:
         super().__init__(
             registry=registry,
@@ -270,6 +271,7 @@ class WorkerAgent(BaseAgent):
             console=console,
             context_token_threshold=context_token_threshold,
             routing_budget=0,   # no routing phase
+            repo_root=repo_root,
         )
 
     def agent_name(self) -> str:

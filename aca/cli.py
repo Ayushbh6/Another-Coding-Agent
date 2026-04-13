@@ -34,6 +34,7 @@ from aca.llm.models import DEFAULT_MODEL, OpenAIModels, OpenRouterModels
 from aca.llm.providers import ProviderName
 from aca.tools import build_registry
 from aca.tools.registry import PermissionMode
+from aca.tools.workspace import move_task_to_archive
 
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -41,6 +42,7 @@ from aca.tools.registry import PermissionMode
 _CONFIG_PATH = Path.home() / ".aca" / "config.json"
 _DB_PATH = Path("data") / "aca.db"
 _REQUIREMENTS_PATH = Path(__file__).parent.parent / "requirements.txt"
+_TASK_TTL_MS = 12 * 60 * 60 * 1000
 
 
 # ── Pre-flight checks ─────────────────────────────────────────────────────────
@@ -176,6 +178,43 @@ def _setup_local_aca_dir(repo_path: Path) -> None:
     """Ensure .aca/active/ and .aca/exports/ exist inside the repo."""
     (repo_path / ".aca" / "active").mkdir(parents=True, exist_ok=True)
     (repo_path / ".aca" / "exports").mkdir(parents=True, exist_ok=True)
+
+
+def _task_archive_base(repo_path: Path) -> Path:
+    """Archive completed tasks outside the repo under the user's .users root."""
+    return Path.home() / ".users" / "aca" / repo_path.name
+
+
+def _archive_expired_tasks(repo_path: Path, db: Any) -> list[str]:
+    cutoff = int(time.time() * 1000) - _TASK_TTL_MS
+    rows = db.execute(
+        """
+        SELECT task_id
+        FROM tasks
+        WHERE status = 'completed'
+          AND completed_at IS NOT NULL
+          AND completed_at <= ?
+          AND archived_at IS NULL
+        ORDER BY completed_at ASC
+        """,
+        (cutoff,),
+    ).fetchall()
+
+    archived: list[str] = []
+    archive_base = _task_archive_base(repo_path)
+    for row in rows:
+        task_id = row[0]
+        try:
+            move_task_to_archive(
+                task_id=task_id,
+                archive_base=str(archive_base),
+                repo_root=str(repo_path),
+                db=db,
+            )
+            archived.append(task_id)
+        except FileNotFoundError:
+            continue
+    return archived
 
 
 # ── Cyberpunk banner ──────────────────────────────────────────────────────────
@@ -655,6 +694,7 @@ def _build_james(
         console=agent_console,
         repo_context=full_context,
         provider=provider,
+        repo_root=str(repo_path),
     )
 
 
@@ -677,6 +717,9 @@ def _run_session(
 
     agent_console = AgentConsole(console=con, verbosity="quiet")  # share same Console — enables Status/Live
     agent_console._show_content_panel = False  # _render_response is the single display in CLI
+    archived_tasks = _archive_expired_tasks(repo_path, db)
+    if archived_tasks:
+        con.print(f"  [dim]Archived {len(archived_tasks)} completed task(s) to {_task_archive_base(repo_path)}[/]")
     james = _build_james(
         session_id=session_id,
         repo_path=repo_path,
@@ -694,6 +737,9 @@ def _run_session(
     turn_count = 0
 
     while True:
+        archived_tasks = _archive_expired_tasks(repo_path, db)
+        if archived_tasks:
+            con.print(f"\n  [dim]Archived {len(archived_tasks)} completed task(s) to {_task_archive_base(repo_path)}[/]")
         # ── Prompt ────────────────────────────────────────────────────────────
         try:
             raw = Prompt.ask(
@@ -787,7 +833,8 @@ def _run_session(
         # ── Agent turn ────────────────────────────────────────────────────────
         try:
             agent_console.begin_user_turn()
-            response, _ = james.run_turn(raw)
+            with con.status("  [dim cyan]Working…[/]", spinner="dots", spinner_style="cyan"):
+                response, _ = james.run_turn(raw)
         except KeyboardInterrupt:
             con.print("\n  [yellow]Interrupted.[/]\n")
             continue

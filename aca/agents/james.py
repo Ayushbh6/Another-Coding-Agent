@@ -10,8 +10,11 @@ run_turn chains a WorkerAgent run and a follow-up James continuation turn.
 
 from __future__ import annotations
 
+from datetime import datetime, UTC
+from enum import Enum
 import json
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +23,8 @@ from aca.agents.steering import (
     james_wake_user_msg,
     junction_delegate,
     junction_execute_simple,
+    junction_invalid_artifact,
+    junction_route,
     junction_write_artifacts,
     worker_finished_user_msg,
     worker_started_user_msg,
@@ -31,6 +36,43 @@ from aca.tools.registry import PermissionMode, ToolRegistry, ToolResult
 
 
 _GUIDELINES_DIR = str(Path.home() / ".aca" / "example_guidelines")
+_GUIDELINES_ROOT = Path(_GUIDELINES_DIR).resolve()
+
+_JAMES_ORIENT_TOOLS = {
+    "read_file",
+    "list_files",
+    "search_repo",
+    "get_file_outline",
+    "search_memory",
+}
+_JAMES_TASK_CREATE_TOOLS = {"create_task_workspace", "write_task_file"}
+_JAMES_TASK_ARTIFACT_TOOLS = {"read_file", "write_task_file", "search_memory"}
+_JAMES_EXECUTE_SIMPLE_TOOLS = {
+    "read_file",
+    "list_files",
+    "search_repo",
+    "get_file_outline",
+    "search_memory",
+    "write_file",
+    "update_file",
+    "multi_update_file",
+    "apply_patch",
+    "delete_file",
+    "write_task_file",
+    "get_next_todo",
+    "advance_todo",
+    "move_task_to_archive",
+}
+_JAMES_READ_WORKER_RESULT_TOOLS = {"read_file", "list_files", "search_memory"}
+
+
+class JamesPhase(str, Enum):
+    ORIENT = "orient"
+    TASK_CREATE = "task_create"
+    TASK_ARTIFACTS = "task_artifacts"
+    EXECUTE_SIMPLE = "execute_simple"
+    DELEGATE_READY = "delegate_ready"
+    READ_WORKER_RESULT = "read_worker_result"
 
 def _build_james_prompt(repo_context: str = "") -> str:
     """Build James's system prompt, optionally injecting per-session repo context."""
@@ -55,8 +97,8 @@ carefully before writing or deleting anything.
 
 - Task workspace root: `.aca/active/` — all task artifacts live here
 - Global format templates: `{_GUIDELINES_DIR}/` — read-only examples, never write here
-- Permission mode: starts at **READ** and expands to **EDIT** once you call
-  `create_task_workspace` successfully
+- The runtime controls tools by **phase**. You do not choose your own permissions.
+- Task ids are runtime-owned. Call `create_task_workspace()` with no arguments when you want to start a task.
 
 ## Your Tools
 
@@ -72,9 +114,9 @@ Your available tools expand as you move through phases.
 | `get_file_outline(path)` | AST-based class/function/method map with line numbers. Fast orientation. |
 | `search_memory(query)` | Hybrid BM25 + vector search across all session history and past tasks. |
 
-### EDIT mode — unlocked after `create_task_workspace` succeeds
+### Task-init and execution tools
 
-All READ tools, plus:
+The runtime exposes these only in the phases where they are valid:
 
 | Tool | Description |
 |------|-------------|
@@ -83,7 +125,7 @@ All READ tools, plus:
 | `multi_update_file(path, updates[])` | Multiple `{{old_string, new_string}}` edits applied atomically. Rolls back all on any failure. |
 | `apply_patch(path, patch)` | Apply a unified diff patch. |
 | `delete_file(path)` | Delete a file. |
-| `create_task_workspace(task_id)` | Create `.aca/active/<task-id>/`. Returns the task_id on success. **Call once per task.** |
+| `create_task_workspace()` | Start a task workspace. The runtime pins the task id and returns it. **Call once per task.** |
 | `write_task_file(task_id, filename, content)` | Write a file into the task workspace. |
 | `get_next_todo(task_id)` | Mark the next `[ ]` item `[>]` and return it with its index. Idempotent on resume. |
 | `advance_todo(task_id, item_index, action, skip_reason?)` | `complete` → `[x]`, auto-starts next. `skip` → requires ≥ 20-char specific reason; marks `[~]`. Enforces sequential order. |
@@ -148,13 +190,14 @@ Use for everything non-trivial. Determine the sub-type:
 
 ### Phase 3 — TASK INIT (EDIT mode)
 
-1. Call `create_task_workspace(task_id)` — use a short descriptive slug
-   (e.g. `add-type-hints-config`, `analyze-memory-architecture`)
-2. `read_file("{_GUIDELINES_DIR}/task.md")` to see the full required format
-3. `write_task_file(task_id, "task.md", ...)` — required fields are listed below
-4. **Delegated only:** `read_file("{_GUIDELINES_DIR}/plan.md")` →
+1. Call `create_task_workspace()` to start the pinned task workspace
+2. `read_file("{_GUIDELINES_DIR}/task.md")` immediately before writing `task.md`
+3. `write_task_file(task_id, "task.md", ...)` — the runtime validates key header fields and required section headings
+4. **Delegated only:** `read_file("{_GUIDELINES_DIR}/plan.md")` immediately before writing `plan.md` →
    `write_task_file(task_id, "plan.md", ...)`
-5. `read_file("{_GUIDELINES_DIR}/todo.md")` → `write_task_file(task_id, "todo.md", ...)`
+5. `read_file("{_GUIDELINES_DIR}/todo.md")` immediately before writing `todo.md` → `write_task_file(task_id, "todo.md", ...)`
+
+If the runtime tells you an artifact does not match the expected format, stop and fix that artifact before doing anything else.
 
 ---
 
@@ -220,7 +263,7 @@ or route around them.**
 
 | Signal | What triggered it | Required action |
 |--------|------------------|-----------------|
-| `[STEERING — ROUTE]` | Orient budget (3 reads) exhausted | Pick CHAT (answer now, no tools) or TASK (`create_task_workspace` immediately) |
+| `[STEERING — ROUTE]` | Orient budget (3 reads) exhausted | Pick CHAT (answer now) or TASK (`create_task_workspace()` immediately) |
 | `[STEERING — ARTIFACTS]` | Workspace created, `todo.md` missing after several calls | Use `write_task_file` to write missing artifact(s) NOW — no more reads |
 | `[STEERING — EXECUTE]` | `task.md` + `todo.md` written, simple task | Start todo loop: `get_next_todo` → work → `advance_todo` |
 | `[STEERING — DELEGATE]` | All three artifacts done, delegated task | Write brief user handoff text — stop all tool use |
@@ -232,12 +275,12 @@ or route around them.**
 
 ## Artifact Formats
 
-Always read the example template before writing an artifact for the first time.
-Minimum required fields:
+Always read the example template immediately before writing an artifact if you are at all unsure.
+The runtime validates the important header fields and section headings below.
 
 ### task.md
 ```
-task_id: <short-slug>
+task_id: <task-id matching the .aca/active/<task-id>/ folder>
 type: analysis | implement
 delegation: simple | delegated
 status: active
@@ -245,8 +288,20 @@ created_at: <ISO 8601 datetime, e.g. 2026-04-11T14:30:00Z>
 session_id: <uuid>
 turn_id: <uuid>
 
-## Description
-<1–3 sentences: what needs to be done and why>
+# Task: <short one-line title>
+
+## Request
+
+<The original user request, copied verbatim or very closely paraphrased.>
+
+## Context
+
+<Brief summary of what repo files were inspected and what was found during orient phase.
+If nothing was read, write "No prior context inspected.">
+
+## Scope
+
+<What is in scope for this task. What is explicitly out of scope.>
 ```
 Example template: `read_file("{_GUIDELINES_DIR}/task.md")`
 
@@ -254,15 +309,19 @@ Example template: `read_file("{_GUIDELINES_DIR}/task.md")`
 ```
 task_id: <short-slug>
 
-## Objective
-<One specific sentence: what success looks like>
+# Plan: <same short title as task.md>
+
+## Approach
+
+<2–5 sentences describing what will be done and in what order.>
 
 ## Steps
 1. <Step — action and expected outcome>
 2. <Step — ...>
 
-## Risks and Mitigations
-- <Risk>: <How to handle it>
+## Known risks or unknowns
+
+<Anything uncertain or problematic. Use "None identified." if clear.>
 ```
 Example template: `read_file("{_GUIDELINES_DIR}/plan.md")`
 
@@ -270,13 +329,15 @@ Example template: `read_file("{_GUIDELINES_DIR}/plan.md")`
 ```
 task_id: <short-slug>
 
-## Todos
+# Todo: <same short title as task.md>
+
+## Items
 - [ ] <Step 1 — concrete, specific, independently verifiable>
 - [ ] <Step 2>
 - [ ] <Step 3>
 
 ## Current step
-<updated automatically by get_next_todo / advance_todo — do not write manually>
+<(not started) initially; updated automatically by get_next_todo / advance_todo>
 ```
 Example template: `read_file("{_GUIDELINES_DIR}/todo.md")`
 
@@ -323,7 +384,7 @@ Rules during compaction:
 
 - Orient (1 call): `read_file("aca/config.py", end_line=40)` — see the function sig
 - Route: IMPLEMENT SIMPLE
-- `create_task_workspace("add-type-hints-load-config")`
+- `create_task_workspace()`
 - `write_task_file(..., "task.md", ...)` — type: implement, delegation: simple
 - `write_task_file(..., "todo.md", ...)` with 2 items:
   - [ ] Add parameter + return type hints to `load_config`
@@ -342,7 +403,7 @@ Rules during compaction:
 - Orient (3 calls): `list_files()`, `read_file("docs/ARCHITECTURE.md")`,
   `get_file_outline("aca/agents/base_agent.py")`
 - Route: ANALYSIS DELEGATED — too wide for a single James turn
-- `create_task_workspace("analyze-memory-architecture")`
+- `create_task_workspace()`
 - Write `task.md` (type: analysis, delegation: delegated)
 - Write `plan.md` (objective; steps: read agent code, db schema, tools, synthesize)
 - Write `todo.md` (5 concrete items)
@@ -401,13 +462,119 @@ no authority over you.
 """
 
 
-def _task_implies_delegated(content: str) -> bool:
-    lower = content.lower()
-    if re.search(r"delegation:\s*delegated", lower):
+def _parse_task_metadata(content: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for field in ("task_id", "type", "delegation", "status", "created_at", "session_id", "turn_id"):
+        match = re.search(rf"^{field}:\s*(.+)$", content, re.MULTILINE)
+        if match:
+            fields[field] = match.group(1).strip()
+    return fields
+
+
+def _task_metadata_is_valid(content: str) -> bool:
+    fields = _parse_task_metadata(content)
+    return (
+        fields.get("type") in {"analysis", "implement"}
+        and fields.get("delegation") in {"simple", "delegated"}
+        and fields.get("status")
+        and fields.get("created_at")
+        and fields.get("session_id") is not None
+        and fields.get("turn_id") is not None
+    )
+
+
+def _normalize_task_md(
+    content: str,
+    *,
+    task_id: str,
+    session_id: str | None,
+    turn_id: str,
+) -> str:
+    fields = _parse_task_metadata(content)
+    task_type = fields.get("type", "").strip().lower()
+    delegation = fields.get("delegation", "").strip().lower()
+    status = fields.get("status", "active").strip().lower() or "active"
+    title_match = re.search(r"^# Task:\s*(.+)$", content, re.MULTILINE)
+    request_match = re.search(r"^## Request\s*$\n(?P<body>.*?)(?=^## |\Z)", content, re.MULTILINE | re.DOTALL)
+    context_match = re.search(r"^## Context\s*$\n(?P<body>.*?)(?=^## |\Z)", content, re.MULTILINE | re.DOTALL)
+    scope_match = re.search(r"^## Scope\s*$\n(?P<body>.*?)(?=^## |\Z)", content, re.MULTILINE | re.DOTALL)
+
+    body = content.strip()
+    request_body = request_match.group("body").strip() if request_match else (body or "<Fill request>")
+    context_body = context_match.group("body").strip() if context_match else "No prior context inspected."
+    scope_body = scope_match.group("body").strip() if scope_match else "<Define in-scope and out-of-scope boundaries.>"
+    title = title_match.group(1).strip() if title_match else request_body.splitlines()[0][:120]
+
+    created_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (
+        f"task_id: {task_id}\n"
+        f"type: {task_type}\n"
+        f"delegation: {delegation}\n"
+        f"status: {status}\n"
+        f"created_at: {created_at}\n"
+        f"session_id: {session_id or ''}\n"
+        f"turn_id: {turn_id}\n\n"
+        f"# Task: {title}\n\n"
+        f"## Request\n\n{request_body}\n\n"
+        f"## Context\n\n{context_body}\n\n"
+        f"## Scope\n\n{scope_body}\n"
+    )
+
+
+def _task_route_from_content(content: str) -> str | None:
+    fields = _parse_task_metadata(content)
+    task_type = fields.get("type")
+    delegation = fields.get("delegation")
+    if task_type in {"analysis", "implement"} and delegation in {"simple", "delegated"}:
+        return f"{task_type}_{delegation}"
+    return None
+
+
+def _validate_task_md(content: str, expected_task_id: str) -> str | None:
+    fields = _parse_task_metadata(content)
+    if fields.get("task_id") != expected_task_id:
+        return "task_id must match the pinned workspace task id."
+    if not _task_metadata_is_valid(content):
+        return "required header fields are missing or invalid."
+    required_sections = ["# Task:", "## Request", "## Context", "## Scope"]
+    for section in required_sections:
+        if section not in content:
+            return f"missing required section `{section}`."
+    return None
+
+
+def _validate_plan_md(content: str, expected_task_id: str) -> str | None:
+    fields = _parse_task_metadata(content)
+    if fields.get("task_id") != expected_task_id:
+        return "task_id must match the pinned workspace task id."
+    required_sections = ["# Plan:", "## Approach", "## Steps", "## Known risks or unknowns"]
+    for section in required_sections:
+        if section not in content:
+            return f"missing required section `{section}`."
+    if not re.search(r"^\d+\.\s+", content, re.MULTILINE):
+        return "## Steps must contain at least one numbered step."
+    return None
+
+
+def _validate_todo_md(content: str, expected_task_id: str) -> str | None:
+    fields = _parse_task_metadata(content)
+    if fields.get("task_id") != expected_task_id:
+        return "task_id must match the pinned workspace task id."
+    required_sections = ["# Todo:", "## Items", "## Current step"]
+    for section in required_sections:
+        if section not in content:
+            return f"missing required section `{section}`."
+    if "- [ ]" not in content:
+        return "## Items must contain at least one pending todo item."
+    return None
+
+
+def _path_is_within(target: Path, base: Path) -> bool:
+    try:
+        target.resolve().relative_to(base.resolve())
         return True
-    if "## delegated" in lower or "**delegated**" in lower:
-        return True
-    return "delegated task" in lower
+    except ValueError:
+        return False
 
 
 class JamesAgent(BaseAgent):
@@ -426,9 +593,9 @@ class JamesAgent(BaseAgent):
         session_id: str | None = None,
         console: Any = None,
         context_token_threshold: int = 120_000,
-        routing_budget: int = 3,
         post_task_tool_budget: int = 5,
         repo_context: str = "",
+        repo_root: str = ".",
     ) -> None:
         super().__init__(
             registry=registry,
@@ -442,18 +609,24 @@ class JamesAgent(BaseAgent):
             session_id=session_id,
             console=console,
             context_token_threshold=context_token_threshold,
-            routing_budget=routing_budget,
+            routing_budget=0,
+            repo_root=repo_root,
         )
         self._full_permission_mode = permission_mode
         self._post_task_tool_budget = post_task_tool_budget
         self._repo_context = repo_context
 
+        self._phase: JamesPhase = JamesPhase.ORIENT
         self._james_task_id: str | None = None
         self._james_needs_plan = False
         self._james_task_md_written = False
         self._james_todo_md_written = False
         self._james_plan_md_written = False
         self._james_post_task_tools = 0
+        self._orient_reads = 0
+        self._route: str | None = None
+        self._current_turn_id: str | None = None
+        self._invalid_artifact: tuple[str, str] | None = None
 
     def agent_name(self) -> str:
         return "james"
@@ -463,12 +636,233 @@ class JamesAgent(BaseAgent):
 
     def _reset_agent_turn_state(self) -> None:
         super()._reset_agent_turn_state()
+        self._phase = JamesPhase.ORIENT
         self._james_task_id = None
         self._james_needs_plan = False
         self._james_task_md_written = False
         self._james_todo_md_written = False
         self._james_plan_md_written = False
         self._james_post_task_tools = 0
+        self._orient_reads = 0
+        self._route = None
+        self._current_turn_id = None
+        self._invalid_artifact = None
+
+    def _turn_metadata(self) -> dict[str, Any]:
+        return {"route": self._route, "task_id": self._james_task_id}
+
+    def _set_phase(self, phase: JamesPhase, notes: str = "") -> None:
+        if self._phase == phase:
+            return
+        old_phase = self._phase
+        self._phase = phase
+        if not self._db or not self._james_task_id:
+            return
+        try:
+            self._db.execute(
+                """
+                INSERT INTO task_state_changes (
+                    change_id, task_id, from_state, to_state, agent, changed_at, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    self._james_task_id,
+                    old_phase.value,
+                    phase.value,
+                    self.agent_name(),
+                    int(datetime.now(UTC).timestamp() * 1000),
+                    notes,
+                ),
+            )
+            self._db.commit()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ACA][james] Failed to log task state change: {exc}")
+
+    def _generated_task_id(self) -> str:
+        if self._james_task_id:
+            return self._james_task_id
+        self._james_task_id = f"task-{self._turn_index + 1:03d}-{uuid.uuid4().hex[:6]}"
+        return self._james_task_id
+
+    def _task_workspace_root(self) -> Path | None:
+        if not self._james_task_id:
+            return None
+        return (Path(self._repo_root) / ".aca" / "active" / self._james_task_id).resolve()
+
+    def _task_is_complete_on_disk(self) -> bool:
+        workspace = self._task_workspace_root()
+        if not workspace:
+            return False
+        if self._james_needs_plan:
+            return (workspace / "findings.md").exists() or (workspace / "output.md").exists()
+        todo_md = workspace / "todo.md"
+        if not todo_md.exists():
+            return False
+        content = todo_md.read_text(encoding="utf-8")
+        return "- [ ]" not in content and "- [>]" not in content
+
+    def _allowed_tools_for_phase(self) -> set[str]:
+        if self._phase == JamesPhase.ORIENT:
+            return set(_JAMES_ORIENT_TOOLS)
+        if self._phase == JamesPhase.TASK_CREATE:
+            return set(_JAMES_TASK_CREATE_TOOLS)
+        if self._phase == JamesPhase.TASK_ARTIFACTS:
+            return set(_JAMES_TASK_ARTIFACT_TOOLS)
+        if self._phase == JamesPhase.EXECUTE_SIMPLE:
+            return set(_JAMES_EXECUTE_SIMPLE_TOOLS)
+        if self._phase == JamesPhase.READ_WORKER_RESULT:
+            return set(_JAMES_READ_WORKER_RESULT_TOOLS)
+        return set()
+
+    def _mark_task_completed(self) -> None:
+        if not self._db or not self._james_task_id or not self._task_is_complete_on_disk():
+            return
+        completed_at = int(datetime.now(UTC).timestamp() * 1000)
+        try:
+            self._db.execute(
+                """
+                UPDATE tasks
+                SET status = 'completed', completed_at = COALESCE(completed_at, ?)
+                WHERE task_id = ?
+                """,
+                (completed_at, self._james_task_id),
+            )
+            self._db.execute(
+                """
+                INSERT INTO task_state_changes (
+                    change_id, task_id, from_state, to_state, agent, changed_at, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    self._james_task_id,
+                    self._phase.value,
+                    "completed",
+                    self.agent_name(),
+                    completed_at,
+                    "Task completed and eligible for archival after TTL.",
+                ),
+            )
+            self._db.commit()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ACA][james] Failed to mark task completed: {exc}")
+
+    def _parse_current_task_file(self) -> dict[str, str]:
+        workspace = self._task_workspace_root()
+        if not workspace:
+            return {}
+        task_md = workspace / "task.md"
+        if not task_md.exists():
+            return {}
+        return _parse_task_metadata(task_md.read_text(encoding="utf-8"))
+
+    def _prepare_tool_call(
+        self,
+        tool_call: dict,
+        *,
+        turn_id: str,
+        current_mode: PermissionMode,
+    ) -> dict:
+        del current_mode
+        self._current_turn_id = turn_id
+        tc = json.loads(json.dumps(tool_call))
+        fn = tc.setdefault("function", {})
+        tool_name = fn.get("name", "")
+        try:
+            args = json.loads(fn.get("arguments", "{}") or "{}")
+        except json.JSONDecodeError:
+            return tc
+
+        if tool_name == "create_task_workspace":
+            args["task_id"] = self._generated_task_id()
+
+        if tool_name == "write_task_file":
+            args["task_id"] = self._generated_task_id()
+            filename = args.get("filename")
+            if filename == "task.md":
+                args["content"] = _normalize_task_md(
+                    args.get("content", ""),
+                    task_id=self._generated_task_id(),
+                    session_id=self._session_id,
+                    turn_id=turn_id,
+                )
+
+        fn["arguments"] = json.dumps(args)
+        return tc
+
+    def _task_title_from_content(self, content: str) -> str:
+        match = re.search(r"^# Task:\s*(.+)$", content, re.MULTILINE)
+        if match:
+            return match.group(1).strip()[:120]
+        return self._james_task_id or "task"
+
+    def _update_task_record_from_task_md(self, content: str) -> None:
+        if not self._db or not self._james_task_id:
+            return
+        fields = _parse_task_metadata(content)
+        try:
+            self._db.execute(
+                """
+                UPDATE tasks
+                SET task_type = ?, delegation = ?, title = ?
+                WHERE task_id = ?
+                """,
+                (
+                    fields.get("type", "unknown"),
+                    fields.get("delegation", "unknown"),
+                    self._task_title_from_content(content),
+                    self._james_task_id,
+                ),
+            )
+            self._db.commit()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ACA][james] Failed to update task row: {exc}")
+
+    def _validate_tool_call_args(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        turn_id: str,
+        current_mode: PermissionMode,
+    ) -> str | None:
+        del turn_id, current_mode
+        if tool_name == "write_task_file":
+            if args.get("task_id") != self._james_task_id:
+                return "James may only write artifacts in the pinned task workspace."
+            filename = args.get("filename", "")
+            if self._phase == JamesPhase.TASK_CREATE and filename != "task.md":
+                return "James must write task.md before any other task artifact."
+            if self._phase == JamesPhase.TASK_ARTIFACTS and filename not in {"task.md", "plan.md", "todo.md"}:
+                return "During task-init, James may only write task.md, plan.md, or todo.md."
+
+        if tool_name == "read_file":
+            path_arg = str(args.get("path", ""))
+            target = Path(path_arg)
+            if not target.is_absolute():
+                target = (Path(self._repo_root) / path_arg).resolve()
+            workspace = self._task_workspace_root()
+            allowed = False
+            if _path_is_within(target, _GUIDELINES_ROOT):
+                allowed = True
+            elif workspace and _path_is_within(target, workspace):
+                allowed = True
+            if self._phase == JamesPhase.TASK_ARTIFACTS and not allowed:
+                return "During task-init, James may only read global templates or files in the pinned task workspace."
+            if self._phase == JamesPhase.READ_WORKER_RESULT and workspace and not _path_is_within(target, workspace):
+                return "When reading worker results, James may only inspect files in the pinned task workspace."
+
+        if tool_name == "list_files" and self._phase == JamesPhase.READ_WORKER_RESULT:
+            path_arg = str(args.get("path", ".aca/active"))
+            target = Path(path_arg)
+            if not target.is_absolute():
+                target = (Path(self._repo_root) / path_arg).resolve()
+            workspace = self._task_workspace_root()
+            if workspace and not _path_is_within(target, workspace):
+                return "When reading worker results, James may only list files in the pinned task workspace."
+
+        return None
 
     def _artifacts_done(self) -> bool:
         if not self._james_task_md_written or not self._james_todo_md_written:
@@ -486,31 +880,55 @@ class JamesAgent(BaseAgent):
         routed: bool,
     ) -> None:
         del routed
+        try:
+            args = json.loads(raw_args) if raw_args else {}
+        except json.JSONDecodeError:
+            args = {}
         if not result.success:
+            if tool_name == "write_task_file" and args.get("filename") == "task.md":
+                self._james_task_md_written = False
             return
         if tool_name == "create_task_workspace":
             out = result.output or {}
             if isinstance(out, dict) and out.get("task_id"):
                 self._james_task_id = str(out["task_id"])
+                self._set_phase(JamesPhase.TASK_CREATE, "Task workspace created.")
             return
 
+        if tool_name in {"read_file", "list_files", "search_repo", "get_file_outline"} and self._phase == JamesPhase.ORIENT:
+            self._orient_reads += 1
+
         if tool_name == "write_task_file":
-            try:
-                args = json.loads(raw_args) if raw_args else {}
-            except json.JSONDecodeError:
-                args = {}
             filename = args.get("filename", "")
             content = args.get("content", "")
             if filename == "task.md":
-                self._james_task_md_written = True
-                if isinstance(content, str) and _task_implies_delegated(content):
-                    self._james_needs_plan = True
+                task_error = _validate_task_md(content, self._james_task_id or "")
+                self._james_task_md_written = task_error is None
+                route = _task_route_from_content(content) if task_error is None else None
+                self._route = route
+                self._james_needs_plan = bool(route and route.endswith("_delegated"))
+                if task_error is None:
+                    self._invalid_artifact = None
+                    self._update_task_record_from_task_md(content)
+                    self._set_phase(JamesPhase.TASK_ARTIFACTS, "task.md written with valid route metadata.")
+                else:
+                    self._invalid_artifact = ("task.md", task_error)
             elif filename == "todo.md":
-                self._james_todo_md_written = True
+                todo_error = _validate_todo_md(content, self._james_task_id or "")
+                self._james_todo_md_written = todo_error is None
+                if todo_error is None:
+                    self._invalid_artifact = None
+                else:
+                    self._invalid_artifact = ("todo.md", todo_error)
             elif filename == "plan.md":
-                self._james_plan_md_written = True
+                plan_error = _validate_plan_md(content, self._james_task_id or "")
+                self._james_plan_md_written = plan_error is None
+                if plan_error is None:
+                    self._invalid_artifact = None
+                else:
+                    self._invalid_artifact = ("plan.md", plan_error)
 
-        if self._james_task_id and not self._artifacts_done():
+        if self._phase == JamesPhase.TASK_ARTIFACTS and self._james_task_id and not self._artifacts_done():
             self._james_post_task_tools += 1
 
     def _extra_pre_llm_steering(
@@ -524,42 +942,57 @@ class JamesAgent(BaseAgent):
         routed: bool,
         tool_calls_this_turn: int,
     ) -> tuple[list | None, str | None, PermissionMode]:
-        del routing_tools_used, tool_calls_this_turn
+        del routing_tools_used, routed
 
-        if (
-            routed
-            and self._james_task_id
+        if self._phase == JamesPhase.ORIENT and self._orient_reads >= 3 and "route" not in self._steering_fired:
+            self._inject_steering(messages, junction_route(self._orient_reads))
+            self._steering_fired.add("route")
+            self._phase = JamesPhase.TASK_CREATE
+
+        if self._invalid_artifact:
+            filename, reason = self._invalid_artifact
+            self._inject_steering(messages, junction_invalid_artifact(filename, reason))
+            tools = self._registry.get_schemas_for_names({"read_file", "write_task_file"})
+            return tools, tool_choice, PermissionMode.EDIT
+
+        if self._phase == JamesPhase.TASK_ARTIFACTS and (
+            self._james_post_task_tools >= self._post_task_tool_budget
             and not self._artifacts_done()
-            and self._james_post_task_tools >= self._post_task_tool_budget
             and "write_artifacts" not in self._steering_fired
         ):
             j = junction_write_artifacts(self._james_post_task_tools, self._james_needs_plan)
             self._inject_steering(messages, j)
             self._steering_fired.add("write_artifacts")
-            tools = self._registry.get_schemas(PermissionMode.EDIT)
-            current_mode = PermissionMode.EDIT
-            return tools, tool_choice, current_mode
 
-        if (
-            self._artifacts_done()
-            and not self._james_needs_plan
-            and "execute_simple" not in self._steering_fired
-        ):
+        if self._artifacts_done() and not self._james_needs_plan and "execute_simple" not in self._steering_fired:
             j = junction_execute_simple()
             self._inject_steering(messages, j)
             self._steering_fired.add("execute_simple")
-            return tools, tool_choice, current_mode
+            self._set_phase(JamesPhase.EXECUTE_SIMPLE, "Artifacts complete for simple task.")
 
-        if (
-            self._artifacts_done()
-            and self._james_needs_plan
-            and "delegate" not in self._steering_fired
-        ):
+        if self._artifacts_done() and self._james_needs_plan and "delegate" not in self._steering_fired:
             j = junction_delegate()
             self._inject_steering(messages, j)
             self._steering_fired.add("delegate")
+            self._set_phase(JamesPhase.DELEGATE_READY, "Artifacts complete for delegated task.")
             tool_choice = j.tool_choice  # "none" — forces plain handoff text, no tool calls
             return None, tool_choice, current_mode
+
+        allowed_tools = self._allowed_tools_for_phase()
+        current_mode = PermissionMode.EDIT if self._phase in {
+            JamesPhase.TASK_CREATE,
+            JamesPhase.TASK_ARTIFACTS,
+            JamesPhase.EXECUTE_SIMPLE,
+            JamesPhase.READ_WORKER_RESULT,
+        } else PermissionMode.READ
+        tools = self._registry.get_schemas_for_names(allowed_tools)
+
+        if (
+            self._phase == JamesPhase.TASK_ARTIFACTS
+            and self._james_post_task_tools >= self._post_task_tool_budget
+            and not self._artifacts_done()
+        ):
+            tools = self._registry.get_schemas_for_names({"write_task_file"})
 
         return tools, tool_choice, current_mode
 
@@ -577,6 +1010,7 @@ class JamesAgent(BaseAgent):
             session_id=self._session_id,
             console=self._console,
             context_token_threshold=self._context_token_threshold,
+            repo_root=self._repo_root,
         )
         handoff = (
             f"Execute the delegated task in workspace `.aca/active/{tid}/`. "
@@ -602,6 +1036,9 @@ class JamesAgent(BaseAgent):
             _continuation=_continuation,
         )
 
+        if not self._james_task_id:
+            self._route = self._route or "chat"
+
         if (
             not _continuation
             and self._james_needs_plan
@@ -623,6 +1060,7 @@ class JamesAgent(BaseAgent):
                     "james_wake",
                     james_wake_user_msg(self._james_task_id),
                 )
+            self._set_phase(JamesPhase.READ_WORKER_RESULT, "Worker finished; James is reading results.")
             follow = (
                 f"Worker finished for task `{self._james_task_id}`. "
                 f"Read `.aca/active/{self._james_task_id}/findings.md` or "
@@ -635,4 +1073,5 @@ class JamesAgent(BaseAgent):
                 stream_callback=stream_callback,
                 _continuation=True,
             )
+        self._mark_task_completed()
         return out, hist

@@ -44,6 +44,7 @@ class BaseAgent(ABC):
         console: Any = None,
         context_token_threshold: int = 80_000,
         routing_budget: int = 0,
+        repo_root: str = ".",
     ) -> None:
         self._registry = registry
         self._permission_mode = permission_mode
@@ -57,6 +58,7 @@ class BaseAgent(ABC):
         self._console = console
         self._context_token_threshold = context_token_threshold
         self._routing_budget = routing_budget
+        self._repo_root = repo_root
 
         self._history: list[dict] = []
         # Parallel to self._history: one entry per Q&A pair recording turn_id.
@@ -111,6 +113,32 @@ class BaseAgent(ABC):
         del messages, routing_tools_used, routed, tool_calls_this_turn
         return tools, tool_choice, current_mode
 
+    def _prepare_tool_call(
+        self,
+        tool_call: dict,
+        *,
+        turn_id: str,
+        current_mode: PermissionMode,
+    ) -> dict:
+        """Last chance for subclasses to rewrite tool args before dispatch."""
+        del turn_id, current_mode
+        return tool_call
+
+    def _turn_metadata(self) -> dict[str, Any]:
+        """Optional extra columns to persist on the turns row."""
+        return {}
+
+    def _validate_tool_call_args(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        turn_id: str,
+        current_mode: PermissionMode,
+    ) -> str | None:
+        del tool_name, args, turn_id, current_mode
+        return None
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def run_turn(
@@ -161,6 +189,11 @@ class BaseAgent(ABC):
                     routed=routed,
                     tool_calls_this_turn=tool_calls_this_turn,
                 )
+            allowed_tool_names = {
+                schema["function"]["name"]
+                for schema in (tools or [])
+                if schema.get("type") == "function" and "function" in schema
+            }
 
             if self._console:
                 n_tools = len(tools) if tools else 0
@@ -233,8 +266,19 @@ class BaseAgent(ABC):
 
             for tc in resp.tool_calls:
                 tool_name = tc.get("function", {}).get("name", "")
+                tc = self._prepare_tool_call(tc, turn_id=turn_id, current_mode=current_mode)
+                tool_name = tc.get("function", {}).get("name", "")
                 raw_args = tc.get("function", {}).get("arguments", "{}")
-                tool_call_id = tc.get("id", str(uuid.uuid4()))
+                try:
+                    parsed_args = json.loads(raw_args) if raw_args else {}
+                except json.JSONDecodeError:
+                    parsed_args = {}
+                arg_error = self._validate_tool_call_args(
+                    tool_name,
+                    parsed_args,
+                    turn_id=turn_id,
+                    current_mode=current_mode,
+                )
 
                 if self._console:
                     try:
@@ -245,7 +289,19 @@ class BaseAgent(ABC):
 
                 t_start = int(time.time() * 1000)
 
-                if tool_name == "compact_context":
+                if arg_error:
+                    result = ToolResult(
+                        tool_call_id=tc.get("id", str(uuid.uuid4())),
+                        tool_name=tool_name,
+                        output=None,
+                        output_json="null",
+                        success=False,
+                        error=arg_error,
+                        latency_ms=int(time.time() * 1000) - t_start,
+                        started_at=t_start,
+                    )
+                    t_end = int(time.time() * 1000)
+                elif tool_name == "compact_context":
                     # ── Intercept: handle compaction directly ─────────────────
                     result = self._execute_compact_context(
                         tc=tc,
@@ -264,17 +320,24 @@ class BaseAgent(ABC):
                     result = self._registry.dispatch(
                         tool_call=tc,
                         mode=current_mode,
+                        allowed_tool_names=allowed_tool_names,
+                        injected_kwargs={
+                            "repo_root": self._repo_root,
+                            "db": self._db,
+                            "session_id": self._session_id,
+                            "turn_id": turn_id,
+                        },
                         db=self._db,
                         turn_id=turn_id,
                         session_id=self._session_id,
                         agent=self.agent_name(),
-                        llm_call_id=None,
+                        llm_call_id=resp.call_id,
                     )
                     t_end = int(time.time() * 1000)
 
                 if self._console:
                     self._console.tool_result(
-                        name=tool_name,
+                        tool_name=tool_name,
                         success=result.success,
                         latency_ms=t_end - t_start,
                         output=result.output if result.success else None,
@@ -312,6 +375,7 @@ class BaseAgent(ABC):
             input_tokens=cumulative_input_tokens,
             output_tokens=cumulative_output_tokens,
             latency_ms=total_latency,
+            metadata=self._turn_metadata(),
         )
 
         return final_response, list(self._history)
@@ -552,14 +616,18 @@ class BaseAgent(ABC):
         input_tokens: int,
         output_tokens: int,
         latency_ms: int,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         if self._db is None:
             return
+        metadata = metadata or {}
         try:
             self._db.execute(
                 """
                 UPDATE turns SET
                     final_response      = ?,
+                    route               = ?,
+                    task_id             = ?,
                     ended_at            = ?,
                     total_input_tokens  = ?,
                     total_output_tokens = ?,
@@ -568,6 +636,8 @@ class BaseAgent(ABC):
                 """,
                 (
                     final_response,
+                    metadata.get("route"),
+                    metadata.get("task_id"),
                     int(time.time() * 1000),
                     input_tokens,
                     output_tokens,

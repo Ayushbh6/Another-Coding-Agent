@@ -151,7 +151,7 @@ def _update_current_step(content: str, text: str | None) -> str:
 # ── Tool implementations ──────────────────────────────────────────────────────
 
 def create_task_workspace(
-    task_id: str,
+    task_id: str | None = None,
     repo_root: str = ".",
     db: Any = None,
     session_id: str | None = None,
@@ -163,6 +163,8 @@ def create_task_workspace(
     Also writes a DB row to the `tasks` table if db + session_id + turn_id are provided.
     Returns {"task_id": str, "workspace_path": str, "created": bool}
     """
+    if not task_id:
+        task_id = f"task-{uuid.uuid4().hex[:8]}"
     _guard_task_id(task_id)
     root = Path(repo_root).resolve()
     task_path = _task_dir(root, task_id)
@@ -485,14 +487,14 @@ _SCHEMAS: list[dict] = [
                 "properties": {
                     "task_id": {
                         "type": "string",
-                        "description": "Unique task identifier slug, e.g. 'task-001' or 'task-abc123'. No slashes or dots.",
+                        "description": "Optional task identifier slug. Runtime may ignore this and pin its own task id.",
                     },
                     "repo_root": {
                         "type": "string",
                         "description": "Absolute path to the repo root.",
                     },
                 },
-                "required": ["task_id"],
+                "required": [],
                 "additionalProperties": False,
             },
         },

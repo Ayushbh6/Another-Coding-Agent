@@ -27,6 +27,7 @@ BaseAgent holds the registry instance and calls:
 from __future__ import annotations
 
 import json
+import inspect
 import subprocess
 import time
 import uuid
@@ -239,6 +240,15 @@ class ToolRegistry:
             if t.category in allowed
         ]
 
+    def get_schemas_for_names(self, names: set[str] | list[str]) -> list[dict]:
+        """Return schemas for the explicit tool names in declaration order."""
+        allowed_names = set(names)
+        return [
+            t.schema
+            for t in self._tools.values()
+            if t.name in allowed_names
+        ]
+
     def get_tool(self, name: str) -> ToolDefinition:
         if name not in self._tools:
             raise KeyError(f"Unknown tool '{name}'. Registered tools: {list(self._tools)}")
@@ -257,6 +267,8 @@ class ToolRegistry:
         tool_call: dict,
         *,
         mode: PermissionMode,
+        allowed_tool_names: set[str] | None = None,
+        injected_kwargs: dict[str, Any] | None = None,
         db: Any = None,
         llm_call_id: str | None = None,
         turn_id: str | None = None,
@@ -307,6 +319,19 @@ class ToolRegistry:
                 started_at, db, llm_call_id, turn_id, session_id, agent,
             )
 
+        if allowed_tool_names is not None and tool_name not in allowed_tool_names:
+            return self._make_error_result(
+                tool_call_id,
+                tool_name,
+                f"Tool '{tool_name}' is not exposed in the current runtime phase.",
+                started_at,
+                db,
+                llm_call_id,
+                turn_id,
+                session_id,
+                agent,
+            )
+
         # Example-guidelines read guard (agent-scoped, read-only reference files)
         if tool_name == "read_file":
             path_arg = args.get("path", "")
@@ -353,7 +378,13 @@ class ToolRegistry:
 
         # Execute
         try:
-            output = tool_def.fn(**args)
+            call_args = dict(args)
+            if injected_kwargs:
+                accepted_params = set(inspect.signature(tool_def.fn).parameters)
+                for key, value in injected_kwargs.items():
+                    if key in accepted_params:
+                        call_args[key] = value
+            output = tool_def.fn(**call_args)
             output_json = json.dumps(output, default=str)
             latency_ms = int(time.time() * 1000) - started_at
             result = ToolResult(

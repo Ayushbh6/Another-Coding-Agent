@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ from aca.llm.providers import ProviderName, get_provider
 
 @dataclass
 class LLMResponse:
+    call_id: str
     content: str | None
     tool_calls: list[dict]          # list of raw tool call dicts from the API
     stop_reason: str                # "end_turn" | "tool_use" | "tool_call_limit" | "max_tokens" | "error"
@@ -188,6 +190,59 @@ def _normalise_stop_reason(raw: str | None) -> str:
         "error":        "error",
     }
     return mapping.get(raw or "", raw or "end_turn")
+
+
+_PSEUDO_TOOL_BLOCK_RE = re.compile(
+    r"<minimax:tool_call>\s*(?P<body>.*?)\s*</minimax:tool_call>",
+    re.DOTALL | re.IGNORECASE,
+)
+_PSEUDO_INVOKE_RE = re.compile(
+    r"<invoke\s+name=\"(?P<name>[^\"]+)\">\s*(?P<body>.*?)\s*</invoke>",
+    re.DOTALL | re.IGNORECASE,
+)
+_PSEUDO_PARAM_RE = re.compile(
+    r"<parameter\s+name=\"(?P<name>[^\"]+)\">(?P<value>.*?)</parameter>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _parse_pseudo_tool_markup(content: str | None) -> tuple[str | None, list[dict]]:
+    """
+    Parse Minimax-style pseudo-tool XML emitted as plain text.
+
+    Returns ``(clean_content, tool_calls)``. ``clean_content`` is the original
+    assistant text with the pseudo-tool block removed. If no pseudo markup is
+    present, returns the original content and an empty list.
+    """
+    if not content:
+        return content, []
+
+    match = _PSEUDO_TOOL_BLOCK_RE.search(content)
+    if not match:
+        return content, []
+
+    tool_calls: list[dict] = []
+    for invoke in _PSEUDO_INVOKE_RE.finditer(match.group("body")):
+        args = {
+            param.group("name"): param.group("value").strip()
+            for param in _PSEUDO_PARAM_RE.finditer(invoke.group("body"))
+        }
+        tool_calls.append(
+            {
+                "id": str(uuid.uuid4()),
+                "type": "function",
+                "function": {
+                    "name": invoke.group("name").strip(),
+                    "arguments": json.dumps(args),
+                },
+            }
+        )
+
+    if not tool_calls:
+        return content, []
+
+    clean_content = _PSEUDO_TOOL_BLOCK_RE.sub("", content).strip()
+    return clean_content or None, tool_calls
 
 
 # ── DB logging helper ─────────────────────────────────────────────────────────
@@ -383,9 +438,16 @@ def call_llm(
             input_tokens = raw.usage.prompt_tokens if raw.usage else 0
             output_tokens = raw.usage.completion_tokens if raw.usage else 0
 
+        if not tool_calls:
+            content, pseudo_tool_calls = _parse_pseudo_tool_markup(content)
+            if pseudo_tool_calls:
+                tool_calls = pseudo_tool_calls
+                stop_reason = "tool_use"
+
         latency_ms = int(time.time() * 1000) - started_at
 
         response = LLMResponse(
+            call_id=call_id,
             content=content,
             tool_calls=tool_calls,
             stop_reason=stop_reason,
@@ -400,6 +462,7 @@ def call_llm(
     except Exception as exc:  # noqa: BLE001
         latency_ms = int(time.time() * 1000) - started_at
         response = LLMResponse(
+            call_id=call_id,
             content=str(exc),
             tool_calls=[],
             stop_reason="error",
@@ -520,6 +583,7 @@ def call_llm_with_limit(
             if forced_stop and response.tool_calls:
                 # Shouldn't happen with tool_choice="none", but guard anyway
                 response = LLMResponse(
+                    call_id=response.call_id,
                     content=response.content,
                     tool_calls=[],
                     stop_reason="tool_call_limit",

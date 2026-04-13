@@ -48,3 +48,20 @@ def test_quiet_console_streams_assistant_tokens_cleanly() -> None:
     assert "stop=" not in rendered
     assert agent_console.consume_streamed_response_flag() is True
     assert agent_console.consume_streamed_response_flag() is False
+
+
+def test_tool_result_accepts_tool_name_keyword() -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, highlight=False)
+    agent_console = AgentConsole(console=console, verbosity="quiet")
+
+    agent_console.tool_call("read_file", {"path": "docs/ARCHITECTURE.md"})
+    agent_console.tool_result(
+        tool_name="read_file",
+        success=True,
+        latency_ms=4,
+        output={"path": "docs/ARCHITECTURE.md", "lines_returned": 120},
+    )
+
+    rendered = buffer.getvalue()
+    assert "Reviewed docs/ARCHITECTURE.md" in rendered

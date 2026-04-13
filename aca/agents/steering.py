@@ -47,7 +47,7 @@ ROUTE_AGENT = (
     "Pick exactly ONE path now:\n"
     "  A) CHAT — Answer the user directly in your next message (plain text, no tools). "
     "Use this only if the request is trivial and you already have enough context.\n"
-    "  B) TASK — Call `create_task_workspace` with a new task_id, then use `write_task_file` "
+    "  B) TASK — Call `create_task_workspace()`, then use `write_task_file` "
     "to write `task.md` describing the work. Use this for anything non-trivial.\n\n"
     "You may use workspace + write_task_file tools now. Choose A or B immediately."
 )
@@ -73,6 +73,18 @@ WRITE_ARTIFACTS_AGENT = (
 WRITE_ARTIFACTS_USER = (
     "[James] Stop wandering — the task folder needs a proper todo list. "
     "Clipboard energy: lock in `todo.md` (and `plan.md` if this is a big one)."
+)
+
+INVALID_ARTIFACT_AGENT = (
+    "[STEERING — FIX ARTIFACT] `{filename}` does not match the required format.\n\n"
+    "Problem detected: {reason}\n\n"
+    "Read the matching example file from `~/.aca/example_guidelines/` now, then rewrite `{filename}` "
+    "so the required header fields and section headings match the expected format. "
+    "Do not continue to other work until `{filename}` is valid."
+)
+
+INVALID_ARTIFACT_USER = (
+    "[James] The paperwork is sloppy — reread the template and rewrite the artifact before moving on."
 )
 
 # EXECUTE_SIMPLE: James does the work himself
@@ -139,6 +151,15 @@ def junction_write_artifacts(n_post_task: int, needs_plan: bool) -> SteeringJunc
         key="write_artifacts",
         agent_msg=WRITE_ARTIFACTS_AGENT.format(n=n_post_task, deleg_hint=deleg_hint),
         user_terminal_msg=WRITE_ARTIFACTS_USER,
+        restrict_to_mode=PermissionMode.EDIT,
+    )
+
+
+def junction_invalid_artifact(filename: str, reason: str) -> SteeringJunction:
+    return SteeringJunction(
+        key="invalid_artifact",
+        agent_msg=INVALID_ARTIFACT_AGENT.format(filename=filename, reason=reason),
+        user_terminal_msg=INVALID_ARTIFACT_USER,
         restrict_to_mode=PermissionMode.EDIT,
     )
 
