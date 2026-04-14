@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from aca.agents.base_agent import BaseAgent
+from aca.agents.tool_docs import render_tool_table
 from aca.agents.steering import SteeringJunction
 from aca.llm.models import DEFAULT_MODEL
 from aca.llm.providers import ProviderName
@@ -43,7 +44,22 @@ def _path_is_within(target: Path, parent: Path) -> bool:
     except ValueError:
         return False
 
-_WORKER_SYSTEM_PROMPT = f"""\
+def _build_worker_prompt(registry: ToolRegistry) -> str:
+    read_table = render_tool_table(
+        registry,
+        ["list_files", "search_repo", "read_files", "get_file_outline"],
+    )
+    write_table = render_tool_table(
+        registry,
+        ["edit_file", "apply_patch", "write_file", "delete_file"],
+    )
+    workspace_table = render_tool_table(
+        registry,
+        ["write_task_file", "get_next_todo", "advance_todo"],
+    )
+    execution_table = render_tool_table(registry, ["run_command", "run_tests"])
+    memory_table = render_tool_table(registry, ["search_memory"])
+    return f"""\
 You are a Worker agent for ACA (Another Coding Agent).
 
 ## Identity
@@ -64,46 +80,54 @@ and responds to the user.
 
 ### Read tools
 
-| Tool | Description |
-|------|-------------|
-| `read_file(path, start_line?, end_line?, max_lines?)` | Read any repo file. Use line ranges to avoid loading huge files entirely. Returns `total_lines` + `truncated` flag. |
-| `list_files(path?, depth?, include_hidden?)` | List directory contents recursively. |
-| `search_repo(pattern, path?, case_insensitive?)` | ripgrep search. Returns file:line matches with context lines. |
-| `get_file_outline(path)` | AST-based class/function/method map with line numbers. Use before editing to find exact target locations. |
+{read_table}
 
 ### Write tools
 
-| Tool | Description |
-|------|-------------|
-| `write_file(path, content, overwrite?)` | Create or replace a file. `overwrite=False` fails if file already exists. |
-| `update_file(path, old_string, new_string)` | Single exact-string replace. Must be unique in the file. |
-| `multi_update_file(path, updates[])` | Multiple `{{old_string, new_string}}` edits, applied atomically. Rolls back all changes on any failure. |
-| `apply_patch(path, patch)` | Apply a unified diff patch. |
-| `delete_file(path)` | Delete a file. |
+{write_table}
 
 ### Task workspace tools
 
-| Tool | Description |
-|------|-------------|
-| `write_task_file(task_id, filename, content)` | Write a file into your workspace `.aca/active/<task-id>/`. Use for `findings.md`, `output.md`, and intermediate notes. |
-| `get_next_todo(task_id)` | Mark the next `[ ]` item `[>]` and return it with its index. Idempotent if `[>]` already exists (safe to call on resume). |
-| `advance_todo(task_id, item_index, action, skip_reason?)` | `complete` → marks `[x]`, auto-starts next item. `skip` → requires ≥ 20-char specific reason, marks `[~]`. Enforces sequential order — you cannot jump ahead. |
+{workspace_table}
 
 ### Execution tools
 
-| Tool | Description |
-|------|-------------|
-| `run_command(command, cwd?)` | Run a shell command. Approved: `python`, `pytest`, build commands. Blocked: `rm -r*`, `sudo`, `curl|sh`, `eval`, fork bombs. |
-| `run_tests(test_path?, args?)` | Run the project test suite. Returns stdout, stderr, exit code, and summary. |
+{execution_table}
+
+`run_command` runs via `/bin/sh -c`. **Pipes, chaining, and redirects are fully allowed.**
+Every executable in the pipeline must be on the safe allowlist (python, pytest, git, grep,
+sed, awk, find, ls, cat, wc, sort, make, npm, cargo, go, etc.).
+
+Common patterns:
+```
+grep -r TODO . | wc -l
+python -m pytest tests/ && echo PASS
+npm install && npm run build
+git diff HEAD | grep "^+" | wc -l
+python script.py > output.txt
+```
+
+**Git local write operations are allowed via `run_command`:**
+`git add`, `git commit`, `git checkout`, `git switch`, `git stash`,
+`git reset --soft`, `git cherry-pick`, `git rebase`, `git merge`, `git tag`
+
+**Still blocked:** `git push`, any `--force`/`-f`, `git clean`, `git reset --hard`
+
+Output is capped at 256 KB per stream. If `result["truncated"]` is true, pipe through
+`head` or `tail` to get the relevant portion instead.
 
 ### Memory tools
 
-| Tool | Description |
-|------|-------------|
-| `search_memory(query)` | Hybrid BM25 + vector retrieval over all past turns, tool traces, and task workspaces. |
+{memory_table}
 
 **All writes are repo-bounded.** `.env`, `.ssh`, credentials files, and paths outside
 the repo root are hard-blocked by the tool layer.
+
+Use `read_files` for one or many reads. A single-file read is just one request item.
+
+After one `edit_file` attempt fails, do not blindly retry another exact-edit batch.
+Re-read the file to get the exact current text. Use `edit_file` for isolated exact
+replacements, or `apply_patch` for larger, overlapping, or context-sensitive edits.
 
 ---
 
@@ -138,8 +162,8 @@ Do NOT skip items to avoid the work.
 ## Output File Formats
 
 Before writing `findings.md` or `output.md` for the first time, read the example
-template: `read_file("{_GUIDELINES_DIR}/findings.md")` or
-`read_file("{_GUIDELINES_DIR}/output.md")`
+template: `read_files(requests=[{{"path":"{_GUIDELINES_DIR}/findings.md"}}])` or
+`read_files(requests=[{{"path":"{_GUIDELINES_DIR}/output.md"}}])`
 
 ### findings.md (analysis tasks)
 
@@ -188,10 +212,11 @@ Correct headers are essential — James reads `task_id` and `status` programmati
 
 | Situation | Action |
 |-----------|--------|
-| `update_file` → "not unique" or "not found" | `read_file` → `get_file_outline` to locate exact text → retry with precise `old_string` |
+| `edit_file` → "not unique" or "not found" | `read_files` → `get_file_outline` to locate exact text → retry with precise edit context |
 | `write_file` fails on path | Verify path is inside repo root. Use `list_files` to confirm parent directory exists. |
 | Ambiguous todo step | Make a reasonable decision. Document it in `## Notes` of your result file. |
-| Test fails after implementation | Read error, fix, re-run. After 2 failed attempts: note the failure in `output.md` and continue. |
+| Test fails after implementation | `run_tests(path="tests/")` or `run_command("python -m pytest <path> -v")`. Read error, fix, re-run. After 2 failed attempts: note failure in `output.md` and continue. |
+| `run_command` output truncated | Re-run with `head`/`tail` pipe (e.g., `pytest tests/ -v | tail -40`) to get the relevant portion. |
 | Step is genuinely impossible | `advance_todo(action='skip', skip_reason='<precise reason>')`. Never leave a `[>]` item permanently stuck. |
 | Context getting long | Wait for compaction phase — the runtime will inject `[STEERING — COMPACT CONTEXT]` and you call `compact_context(compacted_turn_ids=[...])`. Past content stays in `search_memory`. |
 | `[STEERING — LIMIT]` signal received | Stop all tool use immediately. Write your result file with what is complete. Note what remains under `## Notes`. Then stop. |
@@ -292,7 +317,7 @@ class WorkerAgent(BaseAgent):
         return "worker"
 
     def system_prompt(self) -> str:
-        return _WORKER_SYSTEM_PROMPT
+        return _build_worker_prompt(self._registry)
 
     def _task_workspace_root(self) -> Path | None:
         if not self._worker_task_id:
@@ -342,7 +367,17 @@ class WorkerAgent(BaseAgent):
         workspace = self._task_workspace_root()
         repo_aca_active = (Path(self._repo_root) / ".aca" / "active").resolve()
 
-        if tool_name in {"read_file", "get_file_outline"}:
+        if tool_name == "read_files":
+            for request in args.get("requests", []):
+                path_arg = str(request.get("path", ""))
+                target = Path(path_arg)
+                if not target.is_absolute():
+                    target = (Path(self._repo_root) / path_arg).resolve()
+                if _path_is_within(target, repo_aca_active):
+                    if not workspace or not _path_is_within(target, workspace):
+                        return "Worker may only inspect files in the pinned current task workspace."
+
+        if tool_name == "get_file_outline":
             path_arg = str(args.get("path", ""))
             target = Path(path_arg)
             if not target.is_absolute():

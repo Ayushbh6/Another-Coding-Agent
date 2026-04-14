@@ -20,7 +20,7 @@ from pathlib import Path
 
 import whatthepatch
 
-from aca.tools.registry import ToolCategory, ToolDefinition, ToolRegistry
+from aca.tools.registry import ToolCategory, ToolDefinition, ToolExecutionError, ToolRegistry
 from aca.tools.read import _global_aca_dir, _is_sensitive_path, _resolve_and_guard
 
 
@@ -123,65 +123,28 @@ def create_file(path: str, content: str, repo_root: str = ".") -> dict:
     return write_file(path=path, content=content, repo_root=repo_root, overwrite=False)
 
 
-def update_file(path: str, old_string: str, new_string: str, repo_root: str = ".") -> dict:
-    """
-    Replace an exact string occurrence in a file.
-
-    `old_string` must appear exactly once in the file — this prevents silent
-    multi-site edits. If it appears zero or multiple times the tool raises an
-    error with a count so the agent can adjust.
-
-    For multiple replacements in one call, use multi_update_file instead.
-
-    Returns {"path": str, "replaced": 1}
-    """
-    root = Path(repo_root).resolve()
-    target = _guard_write_path(path, root)
-
-    if not target.exists():
-        raise FileNotFoundError(f"File not found: '{path}'")
-
-    original = target.read_text(encoding="utf-8")
-    count = original.count(old_string)
-
-    if count == 0:
-        raise ValueError(
-            f"old_string not found in '{path}'. "
-            "Check for whitespace/indentation differences or use search_repo to locate the exact text."
-        )
-    if count > 1:
-        raise ValueError(
-            f"old_string appears {count} times in '{path}'. "
-            "Provide more surrounding context lines to make it unique."
-        )
-
-    updated = original.replace(old_string, new_string, 1)
-    target.write_text(updated, encoding="utf-8")
-
-    return {
-        "path": str(target.relative_to(root)),
-        "replaced": 1,
-    }
-
-
-def multi_update_file(
+def _raise_edit_failure(
+    *,
     path: str,
-    edits: list[dict],
-    repo_root: str = ".",
-) -> dict:
-    """
-    Apply multiple exact-string replacements to a file atomically.
+    failed_edit_index: int,
+    reason: str,
+    detail: str,
+    suggested_next_tool: list[str],
+) -> None:
+    raise ToolExecutionError(
+        detail,
+        payload={
+            "path": path,
+            "failed_edit_index": failed_edit_index,
+            "reason": reason,
+            "rolled_back": True,
+            "suggested_next_tool": suggested_next_tool,
+        },
+    )
 
-    `edits` is an ordered list of {"old_string": str, "new_string": str} dicts.
-    Rules:
-      - Each old_string must appear exactly once in the *current* file content.
-      - Edits are applied in the order given; each edit sees the result of prior edits.
-      - If any edit fails (not found, or found multiple times), the entire operation
-        is rolled back — the file is left unchanged.
 
-    Returns:
-      {"path": str, "edits_applied": int, "bytes_written": int}
-    """
+def _apply_exact_edits(path: str, edits: list[dict], repo_root: str = ".") -> tuple[dict, str]:
+    """Shared backend for exact-string edit tools."""
     if not edits:
         raise ValueError("edits list is empty — nothing to do.")
 
@@ -201,25 +164,87 @@ def multi_update_file(
             raise ValueError(f"Edit #{i+1}: old_string and new_string must be strings.")
         count = current.count(old)
         if count == 0:
-            raise ValueError(
-                f"Edit #{i+1}: old_string not found in the file at this point. "
-                "Remember edits are applied in order — the file content changes after each step."
+            _raise_edit_failure(
+                path=path,
+                failed_edit_index=i,
+                reason="old_string_not_found",
+                detail=(
+                    f"Edit #{i+1}: old_string not found in '{path}' at the current file state. "
+                    "Edits are applied in order, and this operation is atomic: if any edit fails, "
+                    "the whole batch is rolled back and the file is left unchanged. "
+                    "Do not blindly retry another exact-edit batch. Re-read the file, then use "
+                    "edit_file for isolated exact replacements or apply_patch for larger, overlapping, "
+                    "or context-sensitive edits."
+                ),
+                suggested_next_tool=["read_file", "edit_file"],
             )
         if count > 1:
-            raise ValueError(
-                f"Edit #{i+1}: old_string appears {count} times. "
-                "Provide more surrounding context to make it unique."
+            _raise_edit_failure(
+                path=path,
+                failed_edit_index=i,
+                reason="old_string_not_unique",
+                detail=(
+                    f"Edit #{i+1}: old_string appears {count} times in '{path}'. "
+                    "Edits are order-sensitive and atomic, so the file has been rolled back unchanged. "
+                    "Re-read a larger slice to make the target unique, then use edit_file again or "
+                    "switch to apply_patch if the change is structural."
+                ),
+                suggested_next_tool=["read_files", "apply_patch"],
             )
         current = current.replace(old, new, 1)
 
     # All edits validated — write once
     target.write_text(current, encoding="utf-8")
 
-    return {
+    result = {
         "path": str(target.relative_to(root)),
         "edits_applied": len(edits),
         "bytes_written": len(current.encode("utf-8")),
     }
+    return result, str(target.relative_to(root))
+
+
+def edit_file(path: str, edits: list[dict], repo_root: str = ".") -> dict:
+    """
+    Primary exact-edit tool for ordered atomic replacements in one file.
+
+    Each edit item must be {"old_string": str, "new_string": str}. Every
+    old_string must match exactly once at the moment it is applied. All edits
+    succeed or the file is rolled back unchanged.
+    """
+    result, _rel_path = _apply_exact_edits(path=path, edits=edits, repo_root=repo_root)
+    return result
+
+
+def update_file(path: str, old_string: str, new_string: str, repo_root: str = ".") -> dict:
+    """
+    Legacy exact-edit alias for a single replacement.
+
+    Prefer edit_file for all new prompt guidance.
+    """
+    result, rel_path = _apply_exact_edits(
+        path=path,
+        edits=[{"old_string": old_string, "new_string": new_string}],
+        repo_root=repo_root,
+    )
+    return {
+        "path": rel_path,
+        "replaced": result["edits_applied"],
+    }
+
+
+def multi_update_file(
+    path: str,
+    edits: list[dict],
+    repo_root: str = ".",
+) -> dict:
+    """
+    Legacy exact-edit alias for multiple ordered atomic replacements.
+
+    Prefer edit_file for all new prompt guidance.
+    """
+    result, _rel_path = _apply_exact_edits(path=path, edits=edits, repo_root=repo_root)
+    return result
 
 
 def apply_patch(path: str, patch: str, repo_root: str = ".") -> dict:
@@ -322,7 +347,7 @@ _SCHEMAS: list[dict] = [
                 "Write content to a file inside the repo. "
                 "Set overwrite=false to create a new file and fail if it already exists. "
                 "Set overwrite=true (default) to create or unconditionally replace the file. "
-                "For targeted edits to existing files, prefer update_file or multi_update_file. "
+                "For targeted edits to existing files, prefer edit_file or apply_patch. "
                 "Cannot write into .aca/. Requires EDIT or FULL permission mode."
             ),
             "parameters": {
@@ -356,11 +381,56 @@ _SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "edit_file",
+            "description": (
+                "Apply one or more exact-string replacements to a file in one atomic operation. "
+                "This is the preferred exact-edit tool. Edits are applied in order, and each old_string "
+                "must appear exactly once at the point it is applied. If any edit fails, the whole file "
+                "is rolled back unchanged. Requires EDIT or FULL permission mode."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path to the file from repo root.",
+                    },
+                    "edits": {
+                        "type": "array",
+                        "description": "Ordered list of exact replacements to apply atomically.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": {
+                                    "type": "string",
+                                    "description": "Exact string to replace (must be unique when this edit runs).",
+                                },
+                                "new_string": {
+                                    "type": "string",
+                                    "description": "Replacement string.",
+                                },
+                            },
+                            "required": ["old_string", "new_string"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "repo_root": {
+                        "type": "string",
+                        "description": "Absolute path to the repo root.",
+                    },
+                },
+                "required": ["path", "edits"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "update_file",
             "description": (
-                "Replace a single exact string in a file with a new string. "
-                "old_string must appear exactly once — include enough surrounding lines to make it unique. "
-                "For multiple replacements in one call, use multi_update_file. "
+                "Legacy exact-edit alias for a single replacement. "
+                "Prefer edit_file for all new calls. old_string must appear exactly once. "
                 "Requires EDIT or FULL permission mode."
             ),
             "parameters": {
@@ -393,11 +463,9 @@ _SCHEMAS: list[dict] = [
         "function": {
             "name": "multi_update_file",
             "description": (
-                "Apply multiple exact-string replacements to a file in a single atomic operation. "
-                "Use this for multi-hunk edits to avoid making many sequential tool calls. "
-                "Edits are applied in order — each edit sees the result of the previous ones. "
-                "All edits succeed or the file is left completely unchanged (all-or-nothing). "
-                "Each old_string must appear exactly once at the point it is applied. "
+                "Legacy exact-edit alias for ordered atomic replacements. "
+                "Prefer edit_file for all new calls. Edits are applied in order and "
+                "all edits succeed or the file is left completely unchanged. "
                 "Requires EDIT or FULL permission mode."
             ),
             "parameters": {
@@ -501,6 +569,7 @@ _SCHEMAS: list[dict] = [
 
 _FN_MAP = {
     "write_file": write_file,
+    "edit_file": edit_file,
     "update_file": update_file,
     "multi_update_file": multi_update_file,
     "apply_patch": apply_patch,
@@ -516,4 +585,5 @@ def register(registry: ToolRegistry) -> None:
             fn=_FN_MAP[name],
             schema=schema,
             category=ToolCategory.WRITE,
+            expose_to_agent=(name not in {"update_file", "multi_update_file"}),
         ))

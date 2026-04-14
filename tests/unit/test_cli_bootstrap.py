@@ -18,9 +18,20 @@ def test_build_registry_registers_standard_tools() -> None:
     edit_names = set(registry.list_names(PermissionMode.EDIT))
     full_names = set(registry.list_names(PermissionMode.FULL))
 
-    assert {"read_file", "list_files", "search_repo", "get_file_outline", "search_memory"} <= read_names
-    assert {"write_file", "update_file", "multi_update_file", "create_task_workspace", "write_task_file"} <= edit_names
+    assert {"read_file", "read_files", "list_files", "search_repo", "get_file_outline", "search_memory"} <= read_names
+    assert {"write_file", "edit_file", "update_file", "multi_update_file", "create_task_workspace", "write_task_file"} <= edit_names
     assert {"run_command", "run_tests"} <= full_names
+
+
+def test_agent_visible_schemas_hide_legacy_read_and_exact_edit_tools() -> None:
+    registry = build_registry()
+    edit_schema_names = {schema["function"]["name"] for schema in registry.get_schemas(PermissionMode.EDIT)}
+
+    assert "read_files" in edit_schema_names
+    assert "edit_file" in edit_schema_names
+    assert "read_file" not in edit_schema_names
+    assert "update_file" not in edit_schema_names
+    assert "multi_update_file" not in edit_schema_names
 
 
 def test_build_james_starts_with_registered_tools(tmp_path: Path) -> None:
@@ -41,6 +52,7 @@ def test_build_james_starts_with_registered_tools(tmp_path: Path) -> None:
 
     read_names = set(james._registry.list_names(PermissionMode.READ))
     assert "read_file" in read_names
+    assert "read_files" in read_names
     assert "search_repo" in read_names
     assert "create_task_workspace" in set(james._registry.list_names(PermissionMode.EDIT))
     assert james._stream is True

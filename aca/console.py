@@ -158,6 +158,7 @@ class AgentConsole:
         self._streamed_response_in_turn = True
         if self._verbosity == "quiet":
             self._flush_thinking_stream()  # close thinking block if one was open
+            self._ensure_quiet_response_header()
             self._stream_buf.append(token)
             self._stream_started = True
             self._flush_quiet_stream_blocks()
@@ -314,15 +315,19 @@ class AgentConsole:
         return 0
 
     def _render_quiet_stream_markdown(self, markdown_text: str) -> None:
-        self._stop_status()
+        self._ensure_quiet_response_header()
         body = markdown_text.strip()
         if not body:
             return
-        if not self._quiet_response_started:
-            self._con.print()
-            self._con.print(Text("  ACA", style=_QUIET_LABEL_STYLE))
-            self._quiet_response_started = True
         self._con.print(Padding(Markdown(body), (0, 0, 0, 2)))
+
+    def _ensure_quiet_response_header(self) -> None:
+        if self._quiet_response_started:
+            return
+        self._stop_status()
+        self._con.print()
+        self._con.print(Text("  ACA", style=_QUIET_LABEL_STYLE))
+        self._quiet_response_started = True
 
     # ── Tool call / result ────────────────────────────────────────────────────
 
@@ -417,15 +422,26 @@ class AgentConsole:
 
         if tool_name == "read_file":
             return f"Reviewed {path or 'a file'}"
+        if tool_name == "read_files":
+            slices = data.get("total_slices_read") or 0
+            if slices:
+                label = "slice" if slices == 1 else "file slices"
+                return f"Read {slices} {label}"
+            return "Read file slices"
         if tool_name == "list_files":
             target = str(args.get("path") or data.get("path") or ".")
-            return f"Scanned {target}"
-        if tool_name == "search_repo":
-            pattern = str(args.get("pattern") or "").strip()
-            target = str(args.get("path") or ".")
+            pattern = str(args.get("pattern") or data.get("pattern") or "").strip()
             if pattern:
-                return f"Searched {target} for {pattern}"
-            return f"Searched {target}"
+                return f"Listed files ({pattern}) under {target}"
+            return f"Listed files under {target}"
+        if tool_name == "search_repo":
+            query = str(args.get("query") or data.get("query") or "").strip()
+            file_pattern = str(args.get("file_pattern") or data.get("file_pattern") or "").strip()
+            if query and file_pattern:
+                return f"Searched repo ({file_pattern}) for {query}"
+            if query:
+                return f"Searched repo for {query}"
+            return "Searched repo"
         if tool_name == "get_file_outline":
             return f"Mapped {path or 'file structure'}"
         if tool_name == "search_memory":
@@ -447,8 +463,14 @@ class AgentConsole:
             return f"Updated {path or 'file'}"
         if tool_name == "multi_update_file":
             return f"Applied grouped edits to {path or 'file'}"
+        if tool_name == "edit_file":
+            edits_applied = data.get("edits_applied")
+            if isinstance(edits_applied, int) and edits_applied > 0:
+                noun = "replacement" if edits_applied == 1 else "replacements"
+                return f"Edited {edits_applied} exact {noun} in {path or 'file'}"
+            return f"Edited {path or 'file'}"
         if tool_name == "apply_patch":
-            return f"Patched {path or 'file'}"
+            return f"Applied patch to {path or 'file'}"
         if tool_name == "delete_file":
             return f"Deleted {path or 'file'}"
         if tool_name == "create_task_workspace":

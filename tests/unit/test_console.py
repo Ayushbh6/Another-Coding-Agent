@@ -88,6 +88,89 @@ def test_quiet_console_flushes_plain_sentence_before_stream_end() -> None:
     assert "This is a plain response sentence." in rendered
 
 
+def test_quiet_console_shows_aca_header_on_first_token_even_before_flush() -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, highlight=False)
+    agent_console = AgentConsole(console=console, verbosity="quiet")
+
+    agent_console.begin_user_turn()
+    agent_console.streaming_token("Hi")
+
+    rendered = buffer.getvalue()
+
+    assert "ACA" in rendered
+    assert rendered.count("ACA") == 1
+    assert "Hi" not in rendered
+
+
+def test_quiet_console_summarizes_search_repo_with_query() -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, highlight=False)
+    agent_console = AgentConsole(console=console, verbosity="quiet")
+
+    agent_console.tool_call("search_repo", {"query": "challenger"})
+    agent_console.tool_result(
+        tool_name="search_repo",
+        success=True,
+        latency_ms=5,
+        output={"query": "challenger", "match_count": 3, "matches": []},
+    )
+
+    rendered = buffer.getvalue()
+    assert "Searched repo for challenger" in rendered
+
+
+def test_quiet_console_summarizes_search_repo_with_file_pattern() -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, highlight=False)
+    agent_console = AgentConsole(console=console, verbosity="quiet")
+
+    agent_console.tool_call("search_repo", {"query": "challenger", "file_pattern": "*.py"})
+    agent_console.tool_result(
+        tool_name="search_repo",
+        success=True,
+        latency_ms=5,
+        output={"query": "challenger", "file_pattern": "*.py", "match_count": 2, "matches": []},
+    )
+
+    rendered = buffer.getvalue()
+    assert "Searched repo (*.py) for challenger" in rendered
+
+
+def test_quiet_console_summarizes_read_files() -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, highlight=False)
+    agent_console = AgentConsole(console=console, verbosity="quiet")
+
+    agent_console.tool_call("read_files", {"requests": [{"path": "README.md"}, {"path": "pyproject.toml"}]})
+    agent_console.tool_result(
+        tool_name="read_files",
+        success=True,
+        latency_ms=5,
+        output={"total_slices_read": 2, "results": []},
+    )
+
+    rendered = buffer.getvalue()
+    assert "Read 2 file slices" in rendered
+
+
+def test_quiet_console_summarizes_edit_file() -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, highlight=False)
+    agent_console = AgentConsole(console=console, verbosity="quiet")
+
+    agent_console.tool_call("edit_file", {"path": "aca/agents/challenger.py"})
+    agent_console.tool_result(
+        tool_name="edit_file",
+        success=True,
+        latency_ms=5,
+        output={"path": "aca/agents/challenger.py", "edits_applied": 2},
+    )
+
+    rendered = buffer.getvalue()
+    assert "Edited 2 exact replacements in aca/agents/challenger.py" in rendered
+
+
 def test_tool_result_accepts_tool_name_keyword() -> None:
     buffer = StringIO()
     console = Console(file=buffer, force_terminal=False, color_system=None, highlight=False)

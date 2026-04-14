@@ -11,6 +11,7 @@ from aca.tools.read import (
     get_file_outline,
     list_files,
     read_file,
+    read_files,
     search_repo,
 )
 
@@ -86,6 +87,44 @@ class TestReadFile:
         assert result["total_lines"] == 0
         assert result["lines_returned"] == 0
         assert result["content"] == ""
+
+
+class TestReadFiles:
+    def test_reads_single_file_via_requests(self, repo):
+        (repo / "hello.py").write_text("line1\nline2\n")
+        result = read_files(
+            requests=[{"path": "hello.py"}],
+            repo_root=str(repo),
+        )
+        assert result["total_slices_read"] == 1
+        assert result["results"][0]["content"] == "line1\nline2\n"
+
+    def test_reads_multiple_spans_in_order(self, repo):
+        (repo / "f.txt").write_text("a\nb\nc\nd\n")
+        result = read_files(
+            requests=[
+                {"path": "f.txt", "start_line": 3, "end_line": 4},
+                {"path": "f.txt", "start_line": 1, "end_line": 1},
+            ],
+            repo_root=str(repo),
+        )
+        assert [item["content"] for item in result["results"]] == ["c\nd\n", "a\n"]
+
+    def test_global_budget_omits_later_requests(self, repo):
+        (repo / "a.txt").write_text("1\n2\n3\n")
+        (repo / "b.txt").write_text("4\n5\n6\n")
+        result = read_files(
+            requests=[{"path": "a.txt"}, {"path": "b.txt"}],
+            repo_root=str(repo),
+            max_total_lines=3,
+        )
+        assert result["total_slices_read"] == 1
+        assert result["omitted_count"] == 1
+        assert "max_total_lines=3" in result["omitted_reason"]
+
+    def test_rejects_empty_requests(self, repo):
+        with pytest.raises(ValueError, match="empty"):
+            read_files(requests=[], repo_root=str(repo))
 
 
 # ── list_files ────────────────────────────────────────────────────────────────

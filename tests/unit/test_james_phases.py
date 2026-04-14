@@ -37,7 +37,7 @@ def test_orient_budget_switches_james_to_task_create(tmp_path: Path) -> None:
     james = _build_james(tmp_path)
 
     for _ in range(3):
-        james._on_tool_completed("read_file", "{}", _ok_result("read_file"), routed=False)
+        james._on_tool_completed("read_files", "{}", _ok_result("read_files"), routed=False)
 
     tools, _tool_choice, current_mode = james._extra_pre_llm_steering(
         messages=[],
@@ -155,7 +155,7 @@ def test_invalid_task_md_sets_rewrite_steering_and_restricts_tools(tmp_path: Pat
 
     assert james._james_task_md_written is False
     assert current_mode == PermissionMode.EDIT
-    assert {schema["function"]["name"] for schema in tools or []} == {"read_file", "write_task_file"}
+    assert {schema["function"]["name"] for schema in tools or []} == {"read_files", "write_task_file"}
 
 
 def test_task_artifact_phase_restricts_reads_to_templates_or_workspace(tmp_path: Path) -> None:
@@ -166,20 +166,50 @@ def test_task_artifact_phase_restricts_reads_to_templates_or_workspace(tmp_path:
     workspace.mkdir(parents=True)
 
     err = james._validate_tool_call_args(
-        "read_file",
-        {"path": "aca/cli.py"},
+        "read_files",
+        {"requests": [{"path": "aca/cli.py"}]},
         turn_id="turn-1",
         current_mode=PermissionMode.EDIT,
     )
     assert err is not None
 
     ok = james._validate_tool_call_args(
-        "read_file",
-        {"path": str(workspace / "task.md")},
+        "read_files",
+        {"requests": [{"path": str(workspace / "task.md")}]},
         turn_id="turn-1",
         current_mode=PermissionMode.EDIT,
     )
     assert ok is None
+
+
+def test_james_prompt_uses_current_model_facing_tool_signatures(tmp_path: Path) -> None:
+    james = _build_james(tmp_path)
+    prompt = james.system_prompt()
+
+    assert "read_files(requests, max_total_lines?)" in prompt
+    assert "search_repo(query, file_pattern?" in prompt
+    assert "edit_file(path, edits)" in prompt
+    assert "After one `edit_file` attempt fails" in prompt
+    assert "read_file(path, start_line?, end_line?, max_lines?)" not in prompt
+    assert "multi_update_file(path, edits[])" not in prompt
+
+
+def test_worker_prompt_uses_current_model_facing_tool_signatures(tmp_path: Path) -> None:
+    worker = WorkerAgent(
+        registry=build_registry(),
+        session_id="session-123",
+        repo_root=str(tmp_path),
+        thinking=False,
+        stream=False,
+    )
+    prompt = worker.system_prompt()
+
+    assert "read_files(requests, max_total_lines?)" in prompt
+    assert "search_repo(query, file_pattern?" in prompt
+    assert "edit_file(path, edits)" in prompt
+    assert "After one `edit_file` attempt fails" in prompt
+    assert "read_file(path, start_line?, end_line?, max_lines?)" not in prompt
+    assert "multi_update_file(path, edits[])" not in prompt
 
 
 def test_worker_stops_after_writing_result_file(tmp_path: Path) -> None:
@@ -223,7 +253,7 @@ def test_worker_passes_through_tools_before_result_file(tmp_path: Path) -> None:
         stream=False,
     )
 
-    original_tools = [{"type": "function", "function": {"name": "read_file"}}]
+    original_tools = [{"type": "function", "function": {"name": "read_files"}}]
     tools, tool_choice, current_mode = worker._extra_pre_llm_steering(
         messages=[],
         tools=original_tools,
@@ -297,16 +327,16 @@ def test_worker_blocks_reading_other_task_workspace(tmp_path: Path) -> None:
     other.mkdir(parents=True)
 
     err = worker._validate_tool_call_args(
-        "read_file",
-        {"path": str(other / "task.md")},
+        "read_files",
+        {"requests": [{"path": str(other / "task.md")}]},
         turn_id="turn-1",
         current_mode=PermissionMode.FULL,
     )
     assert err is not None
 
     ok = worker._validate_tool_call_args(
-        "read_file",
-        {"path": str(current / "task.md")},
+        "read_files",
+        {"requests": [{"path": str(current / "task.md")}]},
         turn_id="turn-1",
         current_mode=PermissionMode.FULL,
     )

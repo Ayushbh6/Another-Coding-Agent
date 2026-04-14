@@ -50,18 +50,18 @@ ACA tools are grouped into the following categories:
 Used to inspect the repo.
 
 Examples:
-- read_file
+- read_files
 - list_files
 - search_repo
-- get_repo_summary
+- get_file_outline
 
 ### 3.2 Write Tools
 Used to modify files.
 
 Examples:
 - write_file
-- update_file
-- create_file
+- edit_file
+- delete_file
 - apply_patch
 
 ### 3.3 Execution Tools (Future / Restricted)
@@ -117,7 +117,8 @@ Default mode should be:
 ### Allowed
 - reading any file inside repo
 - listing directories
-- semantic search via RAG
+- search across repo contents
+- retrieving past context via memory search
 
 ### Restricted
 - reading system files outside repo
@@ -136,16 +137,16 @@ Default mode should be:
 ### Allowed
 - create new files inside repo
 - update existing repo files
-- modify `.aca/` workspace files
+- delete repo files when explicitly requested and safe
 
 ### Restricted
 - writing outside repo root
 - modifying system-level files
+- general write tools may not modify `.aca/` workspace files
 
 ### Required behavior
-Before applying changes:
-- show diff (recommended)
-- confirm action (unless auto-approve is enabled)
+Before applying changes, exact edits should prefer one atomic tool call (`edit_file`)
+and escalate to `apply_patch` for structural or context-sensitive edits.
 
 ### Path safety
 - block path traversal (`../`)
@@ -259,7 +260,7 @@ Any attempt to write a file with a name not on this list inside a task subfolder
 
 ### 9.4 Tool routing rules for `.aca/` writes
 
-The general write tools (`write_file`, `create_file`, `update_file`, `apply_patch`) are **blocked from writing into `.aca/` entirely**.
+The general write tools (`write_file`, `edit_file`, `update_file`, `multi_update_file`, `apply_patch`, `delete_file`) are **blocked from writing into `.aca/` entirely**.
 
 All writes into `.aca/active/<task-id>/` must go through the dedicated workspace tool:
 - `write_task_file(task_id, filename, content)` — the only permitted way to write or update an artifact file inside a task subfolder
@@ -318,6 +319,59 @@ This enables:
 - debugging
 - replay
 - trust
+
+---
+
+## 12. Current model-facing repo tool surface
+
+The agent-visible repo tool surface is intentionally small. Compatibility helpers may remain registered internally, but James and Worker should only see the narrower surface below.
+
+### 12.1 Discover
+- `list_files(path=".", pattern=None, max_depth=3, include_hidden=False)`
+- `search_repo(query, file_pattern=None, case_insensitive=False, ...)`
+- `get_file_outline(path)` as an orientation helper
+
+### 12.2 Read
+- `read_files(requests[], max_total_lines=4000)`
+
+`read_files` is the primary read primitive. A single-file read is represented as one request item:
+
+```json
+{
+  "requests": [
+    {"path": "aca/agents/james.py", "start_line": 100, "end_line": 180}
+  ]
+}
+```
+
+Repeated `path` entries are allowed, so one call can request multiple disjoint slices from the same file or small slices from many files.
+
+### 12.3 Edit
+- `edit_file(path, edits[])`
+- `apply_patch(path, patch)`
+- `write_file(path, content, overwrite=False|True)`
+- `delete_file(path)`
+
+`edit_file` is the primary exact-edit primitive. It applies ordered exact replacements atomically inside one file. If any edit fails, the whole operation rolls back unchanged.
+
+`apply_patch` remains separate because unified diff patches have a distinct grammar and are better for structural or overlapping edits.
+
+`write_file` and `delete_file` remain separate because whole-file replacement and destructive deletion carry different risk profiles from exact in-file edits.
+
+### 12.4 Legacy compatibility helpers
+- `read_file`
+- `update_file`
+- `multi_update_file`
+
+These may remain implemented for compatibility and tests, but they should be hidden from agent-visible schemas so the model does not have to choose among redundant tools.
+
+### 12.5 Exact-edit recovery rule
+
+After one failed `edit_file` attempt:
+- do not blindly retry another exact-edit batch
+- re-read the current file state with `read_files`
+- retry `edit_file` only if the target can be made unique and exact
+- switch to `apply_patch` if the change is structural, overlapping, or too context-sensitive for exact replacement
 
 ---
 

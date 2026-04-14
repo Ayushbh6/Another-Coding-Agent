@@ -177,10 +177,19 @@ class ToolDefinition:
     fn: Callable[..., Any]
     schema: dict                    # {"type": "function", "function": {...}}
     category: ToolCategory
+    expose_to_agent: bool = True
 
     @property
     def name(self) -> str:
         return self.schema["function"]["name"]
+
+
+class ToolExecutionError(ValueError):
+    """Structured tool failure that should be surfaced back to the model."""
+
+    def __init__(self, message: str, payload: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.payload = payload or {"error": message}
 
 
 # ── Dispatch result ───────────────────────────────────────────────────────────
@@ -275,7 +284,7 @@ class ToolRegistry:
         return [
             t.schema
             for t in self._tools.values()
-            if t.category in allowed
+            if t.category in allowed and t.expose_to_agent
         ]
 
     def get_schemas_for_names(self, names: set[str] | list[str]) -> list[dict]:
@@ -284,7 +293,7 @@ class ToolRegistry:
         return [
             t.schema
             for t in self._tools.values()
-            if t.name in allowed_names
+            if t.name in allowed_names and t.expose_to_agent
         ]
 
     def get_tool(self, name: str) -> ToolDefinition:
@@ -371,48 +380,63 @@ class ToolRegistry:
             )
 
         # Example-guidelines read guard (agent-scoped, read-only reference files)
-        if tool_name == "read_file":
-            path_arg = args.get("path", "")
-            repo_root_arg = args.get("repo_root", ".")
+        def _guard_read_path(path_arg: str, repo_root_arg: str) -> str | None:
             eg_error = _check_example_guidelines_read(path_arg, repo_root_arg, agent)
             if eg_error:
-                return self._make_error_result(
-                    tool_call_id, tool_name, eg_error, started_at, db,
-                    llm_call_id, turn_id, session_id, agent,
-                )
+                return eg_error
 
-        # Gitignore guard — applies to read_file and get_file_outline.
-        # If the file is gitignored, block it unless the user has explicitly
-        # added it to the session allowlist via /allow.
-        if tool_name in ("read_file", "get_file_outline"):
-            path_arg = args.get("path", "")
-            repo_root_arg = args.get("repo_root", ".")
             repo_root_path = Path(repo_root_arg).resolve()
             p = Path(path_arg)
             resolved_path = (
                 p.resolve() if p.is_absolute()
                 else (repo_root_path / path_arg).resolve()
             )
-            if not self._is_path_read_allowed(resolved_path, repo_root_path):
-                # Fast-path: check if any path component is in the always-excluded set.
-                # Import here to avoid a circular import at module level.
-                from aca.tools.read import _ALWAYS_EXCLUDE_DIRS
-                path_parts = set(resolved_path.parts)
-                if path_parts & _ALWAYS_EXCLUDE_DIRS:
+            if self._is_path_read_allowed(resolved_path, repo_root_path):
+                return None
+
+            # Fast-path: check if any path component is in the always-excluded set.
+            # Import here to avoid a circular import at module level.
+            from aca.tools.read import _ALWAYS_EXCLUDE_DIRS
+            path_parts = set(resolved_path.parts)
+            if path_parts & _ALWAYS_EXCLUDE_DIRS:
+                return (
+                    f"'{path_arg}' is inside a directory that is always excluded "
+                    f"({path_parts & _ALWAYS_EXCLUDE_DIRS}). "
+                    "Use /allow <path> to explicitly unlock a specific file for this session."
+                )
+            if _is_gitignored(resolved_path, repo_root_path):
+                return (
+                    f"'{path_arg}' is listed in .gitignore and cannot be read. "
+                    "If you need to share this file with ACA, use /allow <path> "
+                    "in the terminal to explicitly unlock it for this session."
+                )
+            return None
+
+        injected = injected_kwargs or {}
+        repo_root_arg = str(args.get("repo_root") or injected.get("repo_root") or ".")
+        if tool_name in ("read_file", "get_file_outline"):
+            path_arg = str(args.get("path", ""))
+            guard_error = _guard_read_path(path_arg, repo_root_arg)
+            if guard_error:
+                return self._make_error_result(
+                    tool_call_id, tool_name, guard_error, started_at, db,
+                    llm_call_id, turn_id, session_id, agent,
+                )
+        if tool_name == "read_files":
+            for idx, request in enumerate(args.get("requests", [])):
+                path_arg = str(request.get("path", ""))
+                guard_error = _guard_read_path(path_arg, repo_root_arg)
+                if guard_error:
                     return self._make_error_result(
-                        tool_call_id, tool_name,
-                        f"'{path_arg}' is inside a directory that is always excluded "
-                        f"({path_parts & _ALWAYS_EXCLUDE_DIRS}). "
-                        "Use /allow <path> to explicitly unlock a specific file for this session.",
-                        started_at, db, llm_call_id, turn_id, session_id, agent,
-                    )
-                if _is_gitignored(resolved_path, repo_root_path):
-                    return self._make_error_result(
-                        tool_call_id, tool_name,
-                        f"'{path_arg}' is listed in .gitignore and cannot be read. "
-                        "If you need to share this file with ACA, use /allow <path> "
-                        "in the terminal to explicitly unlock it for this session.",
-                        started_at, db, llm_call_id, turn_id, session_id, agent,
+                        tool_call_id,
+                        tool_name,
+                        f"Request #{idx + 1}: {guard_error}",
+                        started_at,
+                        db,
+                        llm_call_id,
+                        turn_id,
+                        session_id,
+                        agent,
                     )
 
         # Execute
@@ -433,6 +457,20 @@ class ToolRegistry:
                 output_json=output_json,
                 success=True,
                 error=None,
+                latency_ms=latency_ms,
+                started_at=started_at,
+            )
+        except ToolExecutionError as exc:
+            latency_ms = int(time.time() * 1000) - started_at
+            payload = dict(exc.payload)
+            payload.setdefault("error", str(exc))
+            result = ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                output=payload,
+                output_json=json.dumps(payload, default=str),
+                success=False,
+                error=str(exc),
                 latency_ms=latency_ms,
                 started_at=started_at,
             )
@@ -457,7 +495,7 @@ class ToolRegistry:
         Convert a ToolResult into the message dict that must be appended to the
         conversation history so the LLM sees the tool output.
         """
-        content = result.output_json if result.success else json.dumps({"error": result.error})
+        content = result.output_json if result.output_json != "null" else json.dumps({"error": result.error})
         return {
             "role": "tool",
             "tool_call_id": result.tool_call_id,

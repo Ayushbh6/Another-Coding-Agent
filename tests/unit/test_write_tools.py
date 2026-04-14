@@ -11,6 +11,7 @@ from aca.tools.write import (
     apply_patch,
     create_file,
     delete_file,
+    edit_file,
     multi_update_file,
     update_file,
     write_file,
@@ -82,6 +83,50 @@ class TestCreateFile:
     def test_creates_parent_dirs(self, repo):
         create_file("sub/dir/file.py", "x\n", repo_root=str(repo))
         assert (repo / "sub" / "dir" / "file.py").exists()
+
+
+# ── edit_file ────────────────────────────────────────────────────────────────
+
+class TestEditFile:
+    def test_applies_single_exact_edit(self, repo):
+        (repo / "code.py").write_text("def old_name():\n    pass\n")
+        result = edit_file(
+            "code.py",
+            edits=[{"old_string": "def old_name():", "new_string": "def new_name():"}],
+            repo_root=str(repo),
+        )
+        assert result["edits_applied"] == 1
+        assert "new_name" in (repo / "code.py").read_text()
+
+    def test_applies_multiple_exact_edits_atomically(self, repo):
+        (repo / "f.py").write_text("alpha\nbeta\ngamma\n")
+        result = edit_file(
+            "f.py",
+            edits=[
+                {"old_string": "alpha", "new_string": "ALPHA"},
+                {"old_string": "beta", "new_string": "BETA"},
+            ],
+            repo_root=str(repo),
+        )
+        assert result["edits_applied"] == 2
+        assert (repo / "f.py").read_text() == "ALPHA\nBETA\ngamma\n"
+
+    def test_failure_payload_guides_recovery(self, repo):
+        (repo / "f.py").write_text("alpha\nbeta\ngamma\n")
+        with pytest.raises(ValueError) as excinfo:
+            edit_file(
+                "f.py",
+                edits=[
+                    {"old_string": "alpha", "new_string": "ALPHA"},
+                    {"old_string": "missing", "new_string": "MISSING"},
+                ],
+                repo_root=str(repo),
+            )
+        error = excinfo.value
+        assert "atomic" in str(error) or "rolled back" in str(error)
+        assert getattr(error, "payload", {})["failed_edit_index"] == 1
+        assert getattr(error, "payload", {})["rolled_back"] is True
+        assert getattr(error, "payload", {})["suggested_next_tool"] == ["read_file", "edit_file"]
 
 
 # ── update_file ───────────────────────────────────────────────────────────────
@@ -170,6 +215,24 @@ class TestMultiUpdateFile:
             )
         # File must be untouched
         assert (repo / "f.py").read_text() == original
+
+    def test_failure_message_guides_recovery_after_missing_old_string(self, repo):
+        (repo / "f.py").write_text("alpha\nbeta\ngamma\n")
+        with pytest.raises(ValueError) as excinfo:
+            multi_update_file(
+                "f.py",
+                edits=[
+                    {"old_string": "alpha", "new_string": "ALPHA"},
+                    {"old_string": "missing", "new_string": "MISSING"},
+                ],
+                repo_root=str(repo),
+            )
+        message = str(excinfo.value)
+        assert "applied in order" in message
+        assert "atomic" in message or "rolled back" in message
+        assert "Re-read the file" in message
+        assert "edit_file" in message
+        assert "apply_patch" in message
 
     def test_fails_on_non_unique_old_string(self, repo):
         (repo / "f.py").write_text("x\nx\n")

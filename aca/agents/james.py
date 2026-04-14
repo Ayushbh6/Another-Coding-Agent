@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from aca.agents.base_agent import BaseAgent
+from aca.agents.tool_docs import render_tool_table
 from aca.agents.steering import (
     james_wake_user_msg,
     junction_delegate,
@@ -39,31 +40,32 @@ _GUIDELINES_DIR = str(Path.home() / ".aca" / "example_guidelines")
 _GUIDELINES_ROOT = Path(_GUIDELINES_DIR).resolve()
 
 _JAMES_ORIENT_TOOLS = {
-    "read_file",
+    "read_files",
     "list_files",
     "search_repo",
     "get_file_outline",
     "search_memory",
 }
 _JAMES_TASK_CREATE_TOOLS = {"create_task_workspace", "write_task_file"}
-_JAMES_TASK_ARTIFACT_TOOLS = {"read_file", "write_task_file", "search_memory"}
+_JAMES_TASK_ARTIFACT_TOOLS = {"read_files", "write_task_file", "search_memory"}
 _JAMES_EXECUTE_SIMPLE_TOOLS = {
-    "read_file",
+    "read_files",
     "list_files",
     "search_repo",
     "get_file_outline",
     "search_memory",
     "write_file",
-    "update_file",
-    "multi_update_file",
+    "edit_file",
     "apply_patch",
     "delete_file",
     "write_task_file",
     "get_next_todo",
     "advance_todo",
     "move_task_to_archive",
+    "run_command",
+    "run_tests",
 }
-_JAMES_READ_WORKER_RESULT_TOOLS = {"read_file", "list_files", "search_memory"}
+_JAMES_READ_WORKER_RESULT_TOOLS = {"read_files", "list_files", "search_memory"}
 
 
 class JamesPhase(str, Enum):
@@ -74,13 +76,32 @@ class JamesPhase(str, Enum):
     DELEGATE_READY = "delegate_ready"
     READ_WORKER_RESULT = "read_worker_result"
 
-def _build_james_prompt(repo_context: str = "") -> str:
+def _build_james_prompt(registry: ToolRegistry, repo_context: str = "") -> str:
     """Build James's system prompt, optionally injecting per-session repo context."""
     repo_section = (
         f"\n## Repository Context\n\n{repo_context}\n\n---\n"
         if repo_context
         else ""
     )
+    read_table = render_tool_table(
+        registry,
+        ["list_files", "search_repo", "read_files", "get_file_outline", "search_memory"],
+    )
+    task_table = render_tool_table(
+        registry,
+        [
+            "edit_file",
+            "apply_patch",
+            "write_file",
+            "delete_file",
+            "create_task_workspace",
+            "write_task_file",
+            "get_next_todo",
+            "advance_todo",
+            "move_task_to_archive",
+        ],
+    )
+    execution_table = render_tool_table(registry, ["run_command", "run_tests"])
     return f"""\
 You are James, the primary coding agent for ACA (Another Coding Agent).{repo_section}
 ## Identity and Mission
@@ -106,33 +127,36 @@ Your available tools expand as you move through phases.
 
 ### READ mode — available from the start of every turn
 
-| Tool | Description |
-|------|-------------|
-| `read_file(path, start_line?, end_line?, max_lines?)` | Read any file in the repo. Use line ranges on large files. Returns `total_lines` + `truncated` flag. |
-| `list_files(path?, depth?, include_hidden?)` | List directory contents recursively. |
-| `search_repo(pattern, path?, case_insensitive?)` | ripgrep full-text search. Returns file:line matches with context. |
-| `get_file_outline(path)` | AST-based class/function/method map with line numbers. Fast orientation. |
-| `search_memory(query)` | Hybrid BM25 + vector search across all session history and past tasks. |
+{read_table}
 
 ### Task-init and execution tools
 
 The runtime exposes these only in the phases where they are valid:
 
-| Tool | Description |
-|------|-------------|
-| `write_file(path, content, overwrite?)` | Create or replace a file. `overwrite=False` fails if file already exists (safe create). |
-| `update_file(path, old_string, new_string)` | Single exact-string replace. Must be unique in the file. |
-| `multi_update_file(path, updates[])` | Multiple `{{old_string, new_string}}` edits applied atomically. Rolls back all on any failure. |
-| `apply_patch(path, patch)` | Apply a unified diff patch. |
-| `delete_file(path)` | Delete a file. |
-| `create_task_workspace()` | Start a task workspace. The runtime pins the task id and returns it. **Call once per task.** |
-| `write_task_file(task_id, filename, content)` | Write a file into the task workspace. |
-| `get_next_todo(task_id)` | Mark the next `[ ]` item `[>]` and return it with its index. Idempotent on resume. |
-| `advance_todo(task_id, item_index, action, skip_reason?)` | `complete` → `[x]`, auto-starts next. `skip` → requires ≥ 20-char specific reason; marks `[~]`. Enforces sequential order. |
-| `move_task_to_archive(task_id)` | Move the workspace to archive. |
+{task_table}
+
+### Execution tools (EXECUTE_SIMPLE phase only)
+
+When you execute a simple task yourself, you also get:
+
+{execution_table}
+
+`run_command` runs via `/bin/sh -c`. Pipes, chaining (`&&`, `||`, `;`), and redirects
+are allowed. Every executable must be on the safe allowlist. Destructive commands
+(`rm -rf`, `sudo`, `git push`, `--force`) are hard-blocked. Output capped at 256 KB.
+
+Git local write operations are allowed: `git add`, `git commit`, `git checkout`,
+`git switch`, `git stash`, `git reset --soft`, `git cherry-pick`, `git rebase`,
+`git merge`, `git tag`. Blocked: `git push`, `--force`, `git clean`, `git reset --hard`.
 
 All writes are repo-bounded. `.env`, `.ssh`, credentials, and paths outside the repo
 root are hard-blocked by the tool layer. You cannot accidentally exfiltrate data.
+
+Use `read_files` for one or many reads. A single-file read is just one request item.
+
+After one `edit_file` attempt fails, do not blindly retry another exact-edit batch.
+Re-read the file to get the exact current text. Use `edit_file` for isolated exact
+replacements, or `apply_patch` for larger, overlapping, or context-sensitive edits.
 
 ---
 
@@ -146,13 +170,13 @@ Work through these phases in sequence. Do not skip ahead.
 
 **Goal:** Gather just enough context to route confidently.
 
-- Use at most 3 calls from: `read_file`, `list_files`, `search_repo`, `get_file_outline`
+- Use at most 3 calls from: `read_files`, `list_files`, `search_repo`, `get_file_outline`
 - No task workspaces yet. No file writes.
 - A trivial chat question may need 0–1 calls.
 
 **Efficient orient strategies:**
-- Unknown/broad request: `list_files()` → `read_file("README.md")` → targeted search
-- Specific function question: go straight to `get_file_outline` or `read_file`
+- Unknown/broad request: `list_files()` → `read_files(requests=[{{"path":"README.md"}}])` → targeted search
+- Specific function question: go straight to `get_file_outline` or `read_files`
 - Pure chat (no code needed): answer immediately, minimal or no tool use
 
 After 3 orient tool calls, you will receive a `[STEERING — ROUTE]` message.
@@ -191,11 +215,11 @@ Use for everything non-trivial. Determine the sub-type:
 ### Phase 3 — TASK INIT (EDIT mode)
 
 1. Call `create_task_workspace()` to start the pinned task workspace
-2. `read_file("{_GUIDELINES_DIR}/task.md")` immediately before writing `task.md`
+2. `read_files(requests=[{{"path":"{_GUIDELINES_DIR}/task.md"}}])` immediately before writing `task.md`
 3. `write_task_file(task_id, "task.md", ...)` — the runtime validates key header fields and required section headings
-4. **Delegated only:** `read_file("{_GUIDELINES_DIR}/plan.md")` immediately before writing `plan.md` →
+4. **Delegated only:** `read_files(requests=[{{"path":"{_GUIDELINES_DIR}/plan.md"}}])` immediately before writing `plan.md` →
    `write_task_file(task_id, "plan.md", ...)`
-5. `read_file("{_GUIDELINES_DIR}/todo.md")` immediately before writing `todo.md` → `write_task_file(task_id, "todo.md", ...)`
+5. `read_files(requests=[{{"path":"{_GUIDELINES_DIR}/todo.md"}}])` immediately before writing `todo.md` → `write_task_file(task_id, "todo.md", ...)`
 
 If the runtime tells you an artifact does not match the expected format, stop and fix that artifact before doing anything else.
 
@@ -234,7 +258,7 @@ The system will invoke the Worker. You will receive control back once it finishe
 ### Phase 5 — READ WORKER RESULT (delegated tasks only)
 
 After the Worker completes:
-1. `read_file(".aca/active/<task-id>/findings.md")` or `.../output.md`
+1. `read_files(requests=[{{"path":".aca/active/<task-id>/findings.md"}}])` or `.../output.md`
 2. Read any supporting artifacts if needed
 3. Proceed to Finalize
 
@@ -303,7 +327,7 @@ If nothing was read, write "No prior context inspected.">
 
 <What is in scope for this task. What is explicitly out of scope.>
 ```
-Example template: `read_file("{_GUIDELINES_DIR}/task.md")`
+Example template: `read_files(requests=[{{"path":"{_GUIDELINES_DIR}/task.md"}}])`
 
 ### plan.md (delegated tasks only)
 ```
@@ -323,7 +347,7 @@ task_id: <short-slug>
 
 <Anything uncertain or problematic. Use "None identified." if clear.>
 ```
-Example template: `read_file("{_GUIDELINES_DIR}/plan.md")`
+Example template: `read_files(requests=[{{"path":"{_GUIDELINES_DIR}/plan.md"}}])`
 
 ### todo.md
 ```
@@ -339,7 +363,7 @@ task_id: <short-slug>
 ## Current step
 <(not started) initially; updated automatically by get_next_todo / advance_todo>
 ```
-Example template: `read_file("{_GUIDELINES_DIR}/todo.md")`
+Example template: `read_files(requests=[{{"path":"{_GUIDELINES_DIR}/todo.md"}}])`
 
 ---
 
@@ -382,7 +406,7 @@ Rules during compaction:
 ### Walkthrough 2: Implement Simple
 > User: "Add type hints to `load_config` in `aca/config.py`."
 
-- Orient (1 call): `read_file("aca/config.py", end_line=40)` — see the function sig
+- Orient (1 call): `read_files(requests=[{{"path":"aca/config.py","end_line":40}}])` — see the function sig
 - Route: IMPLEMENT SIMPLE
 - `create_task_workspace()`
 - `write_task_file(..., "task.md", ...)` — type: implement, delegation: simple
@@ -390,8 +414,8 @@ Rules during compaction:
   - [ ] Add parameter + return type hints to `load_config`
   - [ ] Verify no existing annotations are overwritten
 - [Steering: EXECUTE fires]
-- `get_next_todo` → item 0 → `update_file` to add hints → `advance_todo(complete)`
-- `get_next_todo` → item 1 → `read_file` to verify → `advance_todo(complete)`
+- `get_next_todo` → item 0 → `edit_file` to add hints → `advance_todo(complete)`
+- `get_next_todo` → item 1 → `read_files` to verify → `advance_todo(complete)`
 - Response: "Added type hints to `load_config` in `aca/config.py` (line 12).
   No existing annotations were present." ✓
 
@@ -400,7 +424,7 @@ Rules during compaction:
 ### Walkthrough 3: Analysis Delegated
 > User: "Analyze the whole agent architecture and tell me where the memory system is weak."
 
-- Orient (3 calls): `list_files()`, `read_file("docs/ARCHITECTURE.md")`,
+- Orient (3 calls): `list_files()`, `read_files(requests=[{{"path":"docs/ARCHITECTURE.md"}}])`,
   `get_file_outline("aca/agents/base_agent.py")`
 - Route: ANALYSIS DELEGATED — too wide for a single James turn
 - `create_task_workspace()`
@@ -419,7 +443,7 @@ Rules during compaction:
 | Situation | Action |
 |-----------|--------|
 | Tool fails with an error | Read the error, fix the argument, retry once. If still failing: note it and continue. |
-| `update_file` → "not unique" | `read_file` the target file → find exact surrounding context → retry with more specific `old_string`. |
+| `edit_file` → "not unique" | `read_files` the target file → find exact surrounding context → retry with more specific `old_string`. |
 | `write_task_file` fails | Verify `create_task_workspace` succeeded first. Then retry. |
 | `[STEERING — ARTIFACTS]` arrives | Stop all reads. Write the missing artifact(s) immediately via `write_task_file`. |
 | `[STEERING — LIMIT]` arrives | No more tools. Summarize what you have. State what remains. |
@@ -632,7 +656,7 @@ class JamesAgent(BaseAgent):
         return "james"
 
     def system_prompt(self) -> str:
-        return _build_james_prompt(self._repo_context)
+        return _build_james_prompt(self._registry, self._repo_context)
 
     def _reset_agent_turn_state(self) -> None:
         super()._reset_agent_turn_state()
@@ -837,21 +861,22 @@ class JamesAgent(BaseAgent):
             if self._phase == JamesPhase.TASK_ARTIFACTS and filename not in {"task.md", "plan.md", "todo.md"}:
                 return "During task-init, James may only write task.md, plan.md, or todo.md."
 
-        if tool_name == "read_file":
-            path_arg = str(args.get("path", ""))
-            target = Path(path_arg)
-            if not target.is_absolute():
-                target = (Path(self._repo_root) / path_arg).resolve()
+        if tool_name == "read_files":
             workspace = self._task_workspace_root()
-            allowed = False
-            if _path_is_within(target, _GUIDELINES_ROOT):
-                allowed = True
-            elif workspace and _path_is_within(target, workspace):
-                allowed = True
-            if self._phase == JamesPhase.TASK_ARTIFACTS and not allowed:
-                return "During task-init, James may only read global templates or files in the pinned task workspace."
-            if self._phase == JamesPhase.READ_WORKER_RESULT and workspace and not _path_is_within(target, workspace):
-                return "When reading worker results, James may only inspect files in the pinned task workspace."
+            for request in args.get("requests", []):
+                path_arg = str(request.get("path", ""))
+                target = Path(path_arg)
+                if not target.is_absolute():
+                    target = (Path(self._repo_root) / path_arg).resolve()
+                allowed = False
+                if _path_is_within(target, _GUIDELINES_ROOT):
+                    allowed = True
+                elif workspace and _path_is_within(target, workspace):
+                    allowed = True
+                if self._phase == JamesPhase.TASK_ARTIFACTS and not allowed:
+                    return "During task-init, James may only read global templates or files in the pinned task workspace."
+                if self._phase == JamesPhase.READ_WORKER_RESULT and workspace and not _path_is_within(target, workspace):
+                    return "When reading worker results, James may only inspect files in the pinned task workspace."
 
         if tool_name == "list_files" and self._phase == JamesPhase.READ_WORKER_RESULT:
             path_arg = str(args.get("path", ".aca/active"))
@@ -895,7 +920,7 @@ class JamesAgent(BaseAgent):
                 self._set_phase(JamesPhase.TASK_CREATE, "Task workspace created.")
             return
 
-        if tool_name in {"read_file", "list_files", "search_repo", "get_file_outline"} and self._phase == JamesPhase.ORIENT:
+        if tool_name in {"read_files", "list_files", "search_repo", "get_file_outline"} and self._phase == JamesPhase.ORIENT:
             self._orient_reads += 1
 
         if tool_name == "write_task_file":
@@ -952,7 +977,7 @@ class JamesAgent(BaseAgent):
         if self._invalid_artifact:
             filename, reason = self._invalid_artifact
             self._inject_steering(messages, junction_invalid_artifact(filename, reason))
-            tools = self._registry.get_schemas_for_names({"read_file", "write_task_file"})
+            tools = self._registry.get_schemas_for_names({"read_files", "write_task_file"})
             return tools, tool_choice, PermissionMode.EDIT
 
         if self._phase == JamesPhase.TASK_ARTIFACTS and (
@@ -979,12 +1004,16 @@ class JamesAgent(BaseAgent):
             return None, tool_choice, current_mode
 
         allowed_tools = self._allowed_tools_for_phase()
-        current_mode = PermissionMode.EDIT if self._phase in {
+        if self._phase == JamesPhase.EXECUTE_SIMPLE:
+            current_mode = PermissionMode.FULL
+        elif self._phase in {
             JamesPhase.TASK_CREATE,
             JamesPhase.TASK_ARTIFACTS,
-            JamesPhase.EXECUTE_SIMPLE,
             JamesPhase.READ_WORKER_RESULT,
-        } else PermissionMode.READ
+        }:
+            current_mode = PermissionMode.EDIT
+        else:
+            current_mode = PermissionMode.READ
         tools = self._registry.get_schemas_for_names(allowed_tools)
 
         if (

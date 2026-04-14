@@ -32,20 +32,35 @@ from aca.tools.read import _resolve_and_guard
 # ── Safety constants ──────────────────────────────────────────────────────────
 
 _DEFAULT_TIMEOUT_SECONDS = 120
+_MAX_OUTPUT_BYTES = 256_000   # 256 KB cap on stdout/stderr returned to the model
 
-_SHELL_CONTROL_TOKENS = ("&&", "||", "|", ";", ">", "<", "`", "$(", "\n")
 _SAFE_EXECUTABLES = {
     "python", "python3", "pytest",
     "rg", "grep", "sed", "awk", "find", "ls", "pwd", "cat",
+    "head", "tail", "wc", "sort", "uniq", "cut", "tr", "tee",
+    "echo", "printf", "true", "false", "test", "[",
+    "xargs", "env", "which", "dirname", "basename", "realpath",
+    "diff", "touch", "mkdir",
     "git",
     "make", "cmake",
     "node", "npm", "npx", "pnpm", "yarn",
-    "uv", "go", "cargo", "swift", "xcodebuild",
+    "pip", "pip3", "uv", "go", "cargo", "swift", "xcodebuild",
 }
 _SAFE_GIT_SUBCOMMANDS = {
+    # read-only
     "status", "diff", "show", "log", "ls-files", "grep",
     "rev-parse", "branch", "blame", "remote", "symbolic-ref", "describe",
+    # write (safe, local-only)
+    "add", "commit", "checkout", "switch", "stash", "reset",
+    "cherry-pick", "rebase", "merge", "tag",
 }
+_BLOCKED_GIT_PATTERNS: list[re.Pattern] = [
+    re.compile(r"\bgit\s+push\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+\S*\s*--force\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+\S*\s*-f\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+clean\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+reset\s+--hard\b", re.IGNORECASE),
+]
 
 # Patterns that are unconditionally blocked regardless of mode
 _BLOCKED_PATTERNS: list[re.Pattern] = [
@@ -64,36 +79,35 @@ _BLOCKED_PATTERNS: list[re.Pattern] = [
 ]
 
 
+def _extract_executables(command: str) -> list[str]:
+    """
+    Return the leading executable name for each pipeline / chained segment.
+
+    Splits on ``|``, ``&&``, ``||``, and ``;`` to find every command that
+    would actually be exec'd by the shell, then resolves to the basename so
+    e.g. ``/usr/bin/python3`` → ``python3``.
+    """
+    segments = re.split(r"\|\||&&|[|;]", command)
+    executables: list[str] = []
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        # Strip leading env-var assignments (FOO=bar cmd …)
+        while "=" in seg.split()[0] if seg.split() else False:
+            seg = seg.split(None, 1)[1] if len(seg.split(None, 1)) > 1 else ""
+        try:
+            argv = shlex.split(seg)
+        except ValueError:
+            argv = seg.split()
+        if argv:
+            executables.append(Path(argv[0]).name.lower())
+    return executables
+
+
 def _check_command_safety(command: str) -> None:
     """Raise ValueError if the command matches any blocked pattern."""
-    if any(token in command for token in _SHELL_CONTROL_TOKENS):
-        raise ValueError(
-            "Command blocked by safety policy. Shell control operators, pipes, "
-            "redirection, command substitution, and multi-command chains are not allowed. "
-            "Run a single direct command instead."
-        )
-
-    try:
-        argv = shlex.split(command)
-    except ValueError as exc:
-        raise ValueError(f"Command blocked by safety policy. Could not parse command: {exc}") from exc
-
-    if not argv:
-        raise ValueError("Command blocked by safety policy. Empty command.")
-
-    exe = Path(argv[0]).name.lower()
-    if exe not in _SAFE_EXECUTABLES:
-        raise ValueError(
-            f"Command blocked by safety policy. Executable '{argv[0]}' is not on the safe allowlist."
-        )
-
-    if exe == "git":
-        if len(argv) < 2 or argv[1] not in _SAFE_GIT_SUBCOMMANDS:
-            raise ValueError(
-                "Command blocked by safety policy. Only read-only git subcommands are allowed "
-                f"via run_command: {sorted(_SAFE_GIT_SUBCOMMANDS)}."
-            )
-
+    # ── Unconditional destructive-pattern blocks ──────────────────────────
     for pattern in _BLOCKED_PATTERNS:
         if pattern.search(command):
             raise ValueError(
@@ -101,6 +115,46 @@ def _check_command_safety(command: str) -> None:
                 f"Matched pattern: '{pattern.pattern}'. "
                 "If you believe this is a false positive, request explicit user approval."
             )
+
+    # ── Git-specific blocks (push, force, clean, reset --hard) ───────────
+    for pattern in _BLOCKED_GIT_PATTERNS:
+        if pattern.search(command):
+            raise ValueError(
+                f"Command blocked by safety policy. "
+                f"Matched git pattern: '{pattern.pattern}'. "
+                "Only local git operations are permitted."
+            )
+
+    # ── Executable allowlist — every segment must use a safe executable ──
+    executables = _extract_executables(command)
+    if not executables:
+        raise ValueError("Command blocked by safety policy. Empty command.")
+
+    for exe in executables:
+        if exe not in _SAFE_EXECUTABLES:
+            raise ValueError(
+                f"Command blocked by safety policy. Executable '{exe}' is not on the safe allowlist."
+            )
+
+    # ── Git subcommand validation ────────────────────────────────────────
+    # Parse each git invocation to verify its subcommand is allowed.
+    segments = re.split(r"\|\||&&|[|;]", command)
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            argv = shlex.split(seg)
+        except ValueError:
+            argv = seg.split()
+        if not argv:
+            continue
+        if Path(argv[0]).name.lower() == "git":
+            if len(argv) < 2 or argv[1] not in _SAFE_GIT_SUBCOMMANDS:
+                raise ValueError(
+                    "Command blocked by safety policy. Git subcommand not on the safe list. "
+                    f"Allowed: {sorted(_SAFE_GIT_SUBCOMMANDS)}."
+                )
 
 
 def _resolve_working_dir(working_dir: str | None, repo_root: str) -> Path:
@@ -130,8 +184,10 @@ def run_command(
     """
     Run a shell command within the repo. FULL permission mode only.
 
-    The command is passed to /bin/sh -c. A hard-blocked pattern list prevents
-    destructive commands. The command must run inside the repo boundary.
+    The command is passed to /bin/sh -c. Pipes, chaining (&&, ||, ;), and
+    redirection are allowed. Every executable in the pipeline must be on the
+    safe allowlist. Destructive patterns (rm -rf, sudo, curl|sh, git push,
+    etc.) are hard-blocked. Output is capped at 256 KB.
 
     Returns:
       {
@@ -140,6 +196,7 @@ def run_command(
         "stdout": str,
         "stderr": str,
         "timed_out": bool,
+        "truncated": bool,
       }
     """
     _check_command_safety(command)
@@ -164,12 +221,22 @@ def run_command(
         exit_code = -1
         timed_out = True
 
+    # ── Output size cap ──────────────────────────────────────────────────
+    truncated = False
+    if len(stdout) > _MAX_OUTPUT_BYTES:
+        stdout = stdout[:_MAX_OUTPUT_BYTES] + "\n... [stdout truncated]"
+        truncated = True
+    if len(stderr) > _MAX_OUTPUT_BYTES:
+        stderr = stderr[:_MAX_OUTPUT_BYTES] + "\n... [stderr truncated]"
+        truncated = True
+
     return {
         "command": command,
         "exit_code": exit_code,
         "stdout": stdout,
         "stderr": stderr,
         "timed_out": timed_out,
+        "truncated": truncated,
     }
 
 
@@ -238,9 +305,10 @@ _SCHEMAS: list[dict] = [
             "name": "run_command",
             "description": (
                 "Run a shell command inside the repo. FULL permission mode only. "
-                "Destructive commands (rm -rf, sudo, curl|sh, etc.) are hard-blocked. "
-                "The command must run within the repository boundary. "
-                "Use sparingly — prefer read and write tools for file operations."
+                "Pipes, chaining (&&, ||, ;), and redirection are allowed. "
+                "Every executable in the pipeline must be on the safe allowlist. "
+                "Destructive patterns (rm -rf, sudo, curl|sh, git push, etc.) are hard-blocked. "
+                "Output is capped at 256 KB."
             ),
             "parameters": {
                 "type": "object",

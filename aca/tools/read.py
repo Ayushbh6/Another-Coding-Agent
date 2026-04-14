@@ -64,6 +64,9 @@ _BLOCKED_FILENAME_PATTERNS = [
     "credentials", "secrets", "token", "private_key",
 ]
 
+_READ_FILE_DEFAULT_MAX_LINES = 2000
+_READ_FILES_DEFAULT_MAX_TOTAL_LINES = 4000
+
 
 def _is_sensitive_path(path: Path) -> bool:
     """Return True if the path looks like a secrets / credentials file."""
@@ -167,8 +170,6 @@ def read_file(
         "truncated": bool,        # True if file has more lines beyond end_line
       }
     """
-    _MAX_LINES_DEFAULT = 2000
-
     root = Path(repo_root).resolve()
     target = _resolve_and_guard(path, root)
     if not target.exists():
@@ -193,7 +194,7 @@ def read_file(
 
     # Apply default cap when no bounds given
     if start_line is None and end_line is None and max_lines is None:
-        e = min(e, s + _MAX_LINES_DEFAULT)
+        e = min(e, s + _READ_FILE_DEFAULT_MAX_LINES)
 
     slice_lines = all_lines[s:e]
     content = "".join(slice_lines)
@@ -214,6 +215,99 @@ def read_file(
         "total_lines": total_lines,
         "truncated": (s + len(slice_lines)) < total_lines,
     }
+
+
+def read_files(
+    requests: list[dict],
+    repo_root: str = ".",
+    max_total_lines: int = _READ_FILES_DEFAULT_MAX_TOTAL_LINES,
+) -> dict:
+    """
+    Read one or more file slices in one call, preserving request order.
+
+    Each request item is:
+      {"path": str, "start_line": int?, "end_line": int?}
+
+    Repeated paths are allowed so callers can request multiple disjoint slices
+    from the same file. The global max_total_lines budget is enforced across the
+    entire batch. Once that budget is exhausted, later requests are omitted.
+    """
+    if not requests:
+        raise ValueError("requests list is empty — nothing to do.")
+    if max_total_lines <= 0:
+        raise ValueError("max_total_lines must be a positive integer.")
+
+    results: list[dict] = []
+    remaining_lines = max_total_lines
+    omitted_count = 0
+
+    for idx, request in enumerate(requests):
+        if not isinstance(request, dict):
+            raise ValueError(f"Request #{idx + 1} must be an object.")
+
+        path = request.get("path")
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError(f"Request #{idx + 1} must include a non-empty path.")
+
+        start_line = request.get("start_line")
+        end_line = request.get("end_line")
+        if start_line is not None and not isinstance(start_line, int):
+            raise ValueError(f"Request #{idx + 1}: start_line must be an integer.")
+        if end_line is not None and not isinstance(end_line, int):
+            raise ValueError(f"Request #{idx + 1}: end_line must be an integer.")
+
+        if remaining_lines <= 0:
+            omitted_count += len(requests) - idx
+            break
+
+        # Bound each individual read by the remaining global budget.
+        bounded_end_line = end_line
+        bounded_max_lines: int | None = None
+        if start_line is not None and end_line is not None:
+            span = (end_line - start_line) + 1
+            if span > remaining_lines:
+                bounded_end_line = start_line + remaining_lines - 1
+        elif start_line is not None:
+            bounded_max_lines = remaining_lines
+        elif end_line is not None:
+            bounded_end_line = min(end_line, remaining_lines)
+        else:
+            bounded_max_lines = min(remaining_lines, _READ_FILE_DEFAULT_MAX_LINES)
+
+        result = read_file(
+            path=path,
+            repo_root=repo_root,
+            start_line=start_line,
+            end_line=bounded_end_line,
+            max_lines=bounded_max_lines,
+        )
+        results.append(result)
+        remaining_lines -= result["lines_returned"]
+
+    omitted_reason = None
+    if omitted_count:
+        omitted_reason = (
+            f"Stopped after reaching max_total_lines={max_total_lines}; "
+            f"omitted {omitted_count} later request(s)."
+        )
+
+    return {
+        "results": results,
+        "total_slices_read": len(results),
+        "total_lines_returned": sum(item["lines_returned"] for item in results),
+        "max_total_lines": max_total_lines,
+        "omitted_count": omitted_count,
+        "omitted_reason": omitted_reason,
+    }
+
+
+def read_many_files(
+    requests: list[dict],
+    repo_root: str = ".",
+    max_total_lines: int = _READ_FILES_DEFAULT_MAX_TOTAL_LINES,
+) -> dict:
+    """Legacy alias kept for compatibility."""
+    return read_files(requests=requests, repo_root=repo_root, max_total_lines=max_total_lines)
 
 
 def _batch_gitignored(paths: list[Path], repo_root: Path) -> set[str]:
@@ -658,6 +752,57 @@ _SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "read_files",
+            "description": (
+                "Read one or more files or file slices in one call. "
+                "Use a single request for one file, or multiple requests for 2+ files, task artifact bundles, "
+                "or multiple disjoint slices from the same file. "
+                "Requests are processed in order and later requests may be omitted once the global line budget is exhausted. "
+                "Blocked for secrets/credential files and paths outside the repo."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "requests": {
+                        "type": "array",
+                        "description": "Ordered list of file read requests.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "Relative path to the file from repo root.",
+                                },
+                                "start_line": {
+                                    "type": "integer",
+                                    "description": "1-based line number to start reading from (inclusive).",
+                                },
+                                "end_line": {
+                                    "type": "integer",
+                                    "description": "1-based line number to stop reading at (inclusive).",
+                                },
+                            },
+                            "required": ["path"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "repo_root": {
+                        "type": "string",
+                        "description": "Absolute path to the repo root. Defaults to cwd.",
+                    },
+                    "max_total_lines": {
+                        "type": "integer",
+                        "description": f"Global line budget across the whole batch. Defaults to {_READ_FILES_DEFAULT_MAX_TOTAL_LINES}.",
+                    },
+                },
+                "required": ["requests"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_repo",
             "description": (
                 "Search the repo for a literal string or regex using ripgrep. "
@@ -731,6 +876,7 @@ _SCHEMAS: list[dict] = [
 
 _FN_MAP = {
     "read_file": read_file,
+    "read_files": read_files,
     "list_files": list_files,
     "search_repo": search_repo,
     "get_file_outline": get_file_outline,
@@ -745,4 +891,5 @@ def register(registry: ToolRegistry) -> None:
             fn=_FN_MAP[name],
             schema=schema,
             category=ToolCategory.READ,
+            expose_to_agent=(name != "read_file"),
         ))
