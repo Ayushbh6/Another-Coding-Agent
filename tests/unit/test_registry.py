@@ -9,6 +9,7 @@ Tests cover:
 """
 
 import json
+import subprocess
 import pytest
 
 from aca.tools.registry import (
@@ -341,3 +342,51 @@ class TestExampleGuidelinesReadGuard:
         )
         result = _make_registry_with_read_file().dispatch(tc, mode=PermissionMode.READ, agent=None)
         assert result.success
+
+
+def _init_git_repo(tmp_path):
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+
+class TestGitignoredWorkspaceReads:
+    def test_allowing_directory_unlocks_descendant_files(self, tmp_path):
+        _init_git_repo(tmp_path)
+        (tmp_path / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+        ignored_dir = tmp_path / "ignored"
+        ignored_dir.mkdir()
+        (ignored_dir / "note.txt").write_text("secret\n", encoding="utf-8")
+
+        registry = _make_registry_with_read_file()
+        tc = _make_tool_call("read_file", {"path": "ignored/note.txt", "repo_root": str(tmp_path)})
+        blocked = registry.dispatch(tc, mode=PermissionMode.READ, agent="james")
+        assert blocked.success is False
+        assert "gitignore" in (blocked.error or "")
+
+        registry.add_to_read_allowlist("ignored", repo_root=str(tmp_path))
+        allowed = registry.dispatch(tc, mode=PermissionMode.READ, agent="james")
+        assert allowed.success is True
+
+    def test_internal_aca_files_are_readable_even_when_gitignored(self, tmp_path):
+        _init_git_repo(tmp_path)
+        (tmp_path / ".gitignore").write_text(".aca/\n", encoding="utf-8")
+        findings = tmp_path / ".aca" / "active" / "task-001" / "findings.md"
+        findings.parent.mkdir(parents=True)
+        findings.write_text("task_id: task-001\nstatus: complete\n", encoding="utf-8")
+
+        registry = _make_registry_with_read_file()
+        tc = _make_tool_call("read_file", {"path": ".aca/active/task-001/findings.md", "repo_root": str(tmp_path)})
+        result = registry.dispatch(tc, mode=PermissionMode.READ, agent="james")
+        assert result.success is True
+
+    def test_list_files_in_internal_aca_workspace_shows_gitignored_artifacts(self, tmp_path):
+        _init_git_repo(tmp_path)
+        (tmp_path / ".gitignore").write_text(".aca/\n", encoding="utf-8")
+        workspace = tmp_path / ".aca" / "active" / "task-001"
+        workspace.mkdir(parents=True)
+        (workspace / "task.md").write_text("task_id: task-001\n", encoding="utf-8")
+        (workspace / "findings.md").write_text("task_id: task-001\nstatus: complete\n", encoding="utf-8")
+
+        result = read_module.list_files(path=".aca/active/task-001", repo_root=str(tmp_path))
+        names = {entry["name"] for entry in result["entries"]}
+        assert ".aca/active/task-001/task.md" in names
+        assert ".aca/active/task-001/findings.md" in names

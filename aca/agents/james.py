@@ -1011,6 +1011,7 @@ class JamesAgent(BaseAgent):
             console=self._console,
             context_token_threshold=self._context_token_threshold,
             repo_root=self._repo_root,
+            current_task_id=tid,
         )
         handoff = (
             f"Execute the delegated task in workspace `.aca/active/{tid}/`. "

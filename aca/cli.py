@@ -23,8 +23,8 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.rule import Rule
-from rich.status import Status
 from rich.table import Table
+from rich.status import Status
 from rich.text import Text
 
 from aca.agents.james import JamesAgent
@@ -414,7 +414,7 @@ def _cmd_allow(
     repo_path: Path,
 ) -> None:
     """
-    Add a specific file to the per-session read allowlist.
+    Add a specific file or directory to the per-session read allowlist.
     Usage: /allow <path>   (relative to repo root or absolute)
     """
     parts = raw_input.strip().split(maxsplit=1)
@@ -833,12 +833,13 @@ def _run_session(
         # ── Agent turn ────────────────────────────────────────────────────────
         try:
             agent_console.begin_user_turn()
-            with con.status("  [dim cyan]Working…[/]", spinner="dots", spinner_style="cyan"):
-                response, _ = james.run_turn(raw)
+            response, _ = james.run_turn(raw)
         except KeyboardInterrupt:
+            agent_console.end_user_turn()
             con.print("\n  [yellow]Interrupted.[/]\n")
             continue
         except Exception as exc:  # noqa: BLE001
+            agent_console.end_user_turn()
             con.print(f"\n  [red]Error:[/] {exc}\n")
             continue
 

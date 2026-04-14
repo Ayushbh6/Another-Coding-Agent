@@ -22,13 +22,17 @@ Usage
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from typing import Any
 
 from rich.console import Console
+from rich.markdown import Markdown
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.rule import Rule
+from rich.status import Status
 from rich.style import Style
 from rich.text import Text
 
@@ -49,7 +53,7 @@ _ASSERT_ERR_STYLE  = Style(color="red",           bold=True)
 _WARN_STYLE        = Style(color="yellow")
 _STEERING_STYLE    = Style(color="bright_magenta", bold=True)
 _QUIET_LABEL_STYLE = Style(color="cyan", bold=True)
-_QUIET_STREAM_STYLE = Style(color="white")
+_ORDERED_LIST_RE   = re.compile(r"\d+\.\s")
 
 
 class AgentConsole:
@@ -87,6 +91,8 @@ class AgentConsole:
         self._pending_tool_name: str | None = None
         self._pending_tool_args: dict[str, Any] = {}
         self._streamed_response_in_turn = False
+        self._quiet_response_started = False
+        self._status: Status | None = None
 
     def begin_user_turn(self) -> None:
         """Reset per-turn UI state before starting a new user-visible turn."""
@@ -94,12 +100,19 @@ class AgentConsole:
         self._pending_tool_name = None
         self._pending_tool_args = {}
         self._streamed_response_in_turn = False
+        self._quiet_response_started = False
+        self._start_status()
 
     def consume_streamed_response_flag(self) -> bool:
         """Return whether any assistant text streamed in the current turn and reset the flag."""
+        self._stop_status()
         value = self._streamed_response_in_turn
         self._streamed_response_in_turn = False
         return value
+
+    def end_user_turn(self) -> None:
+        """Stop transient UI state at the end of a user-visible turn."""
+        self._stop_status()
 
     # ── High-level step marker ────────────────────────────────────────────────
 
@@ -145,12 +158,9 @@ class AgentConsole:
         self._streamed_response_in_turn = True
         if self._verbosity == "quiet":
             self._flush_thinking_stream()  # close thinking block if one was open
-            if not self._stream_started:
-                self._con.print()
-                self._con.print(Text("  ACA  ", style=_QUIET_LABEL_STYLE), end="")
-                self._stream_started = True
-            self._con.print(Text(token, style=_QUIET_STREAM_STYLE), end="")
             self._stream_buf.append(token)
+            self._stream_started = True
+            self._flush_quiet_stream_blocks()
             return
         self._flush_thinking_stream()  # close thinking block if one was open
         if not self._stream_started:
@@ -189,7 +199,8 @@ class AgentConsole:
         """Call once when the stream is complete."""
         self._flush_thinking_stream()
         if self._verbosity == "quiet":
-            if self._stream_started:
+            self._flush_quiet_stream_blocks(force=True)
+            if self._quiet_response_started:
                 self._con.print()
             self._stream_buf.clear()
             self._stream_started = False
@@ -204,6 +215,11 @@ class AgentConsole:
     def _flush_stream(self) -> None:
         """If a stream was partially printed, close it before printing anything else."""
         self._flush_thinking_stream()
+        if self._verbosity == "quiet":
+            self._flush_quiet_stream_blocks(force=True)
+            self._stream_buf.clear()
+            self._stream_started = False
+            return
         if self._stream_started:
             self._con.print()
             self._stream_buf.clear()
@@ -215,6 +231,98 @@ class AgentConsole:
             self._con.print()  # newline
             self._thinking_buf.clear()
             self._thinking_started = False
+
+    def _start_status(self) -> None:
+        if self._verbosity != "quiet" or self._status is not None:
+            return
+        self._status = self._con.status("  [dim cyan]Working…[/]", spinner="dots", spinner_style="cyan")
+        self._status.start()
+
+    def _stop_status(self) -> None:
+        if self._status is None:
+            return
+        self._status.stop()
+        self._status = None
+
+    def _flush_quiet_stream_blocks(self, *, force: bool = False) -> None:
+        pending = "".join(self._stream_buf)
+        if not pending:
+            return
+        renderable, remainder = self._split_renderable_markdown(pending, force=force)
+        if renderable.strip():
+            self._render_quiet_stream_markdown(renderable)
+        self._stream_buf = [remainder] if remainder else []
+
+    def _split_renderable_markdown(self, text: str, *, force: bool) -> tuple[str, str]:
+        if force:
+            return text, ""
+
+        in_code_fence = False
+        line_start = 0
+        cutoff = 0
+        idx = 0
+        length = len(text)
+
+        while idx < length:
+            if text[idx] != "\n":
+                idx += 1
+                continue
+
+            line = text[line_start:idx]
+            stripped = line.lstrip()
+
+            if stripped.startswith("```"):
+                in_code_fence = not in_code_fence
+                if not in_code_fence:
+                    cutoff = idx + 1
+            elif not in_code_fence:
+                if idx + 1 < length and text[idx + 1] == "\n":
+                    cutoff = idx + 2
+                elif (
+                    stripped.startswith("#")
+                    or stripped.startswith("- ")
+                    or stripped.startswith("* ")
+                    or stripped.startswith("> ")
+                    or _ORDERED_LIST_RE.match(stripped)
+                ):
+                    cutoff = idx + 1
+
+            line_start = idx + 1
+            idx += 1
+
+        if cutoff == 0:
+            sentence_cutoff = self._sentence_cutoff(text)
+            if sentence_cutoff > 0:
+                cutoff = sentence_cutoff
+
+        return text[:cutoff], text[cutoff:]
+
+    def _sentence_cutoff(self, text: str) -> int:
+        if len(text) < 24:
+            return 0
+        if text.count("```") % 2 != 0:
+            return 0
+        if text.count("**") % 2 != 0:
+            return 0
+        if text.count("`") % 2 != 0:
+            return 0
+
+        for marker in ("! ", "? ", ". "):
+            idx = text.rfind(marker)
+            if idx >= 0:
+                return idx + len(marker)
+        return 0
+
+    def _render_quiet_stream_markdown(self, markdown_text: str) -> None:
+        self._stop_status()
+        body = markdown_text.strip()
+        if not body:
+            return
+        if not self._quiet_response_started:
+            self._con.print()
+            self._con.print(Text("  ACA", style=_QUIET_LABEL_STYLE))
+            self._quiet_response_started = True
+        self._con.print(Padding(Markdown(body), (0, 0, 0, 2)))
 
     # ── Tool call / result ────────────────────────────────────────────────────
 
@@ -323,6 +431,11 @@ class AgentConsole:
         if tool_name == "search_memory":
             return "Checked memory"
         if tool_name == "run_command":
+            command = str(data.get("command") or args.get("command") or "").strip()
+            if command:
+                if len(command) > 80:
+                    command = command[:77] + "..."
+                return f"Ran command: {command}"
             return "Ran command"
         if tool_name == "run_tests":
             return "Ran tests"

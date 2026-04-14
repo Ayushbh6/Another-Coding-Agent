@@ -21,16 +21,27 @@ Tool budget:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 from aca.agents.base_agent import BaseAgent
+from aca.agents.steering import SteeringJunction
 from aca.llm.models import DEFAULT_MODEL
 from aca.llm.providers import ProviderName
-from aca.tools.registry import PermissionMode, ToolRegistry
+from aca.tools.registry import PermissionMode, ToolRegistry, ToolResult
 
 
 _GUIDELINES_DIR = str(Path.home() / ".aca" / "example_guidelines")
+_WORKER_RESULT_FILES = {"findings.md", "output.md"}
+
+
+def _path_is_within(target: Path, parent: Path) -> bool:
+    try:
+        target.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
 
 _WORKER_SYSTEM_PROMPT = f"""\
 You are a Worker agent for ACA (Another Coding Agent).
@@ -257,6 +268,7 @@ class WorkerAgent(BaseAgent):
         console: Any = None,
         context_token_threshold: int = 120_000,
         repo_root: str = ".",
+        current_task_id: str | None = None,
     ) -> None:
         super().__init__(
             registry=registry,
@@ -273,9 +285,130 @@ class WorkerAgent(BaseAgent):
             routing_budget=0,   # no routing phase
             repo_root=repo_root,
         )
+        self._result_file_written: bool = False
+        self._worker_task_id = current_task_id
 
     def agent_name(self) -> str:
         return "worker"
 
     def system_prompt(self) -> str:
         return _WORKER_SYSTEM_PROMPT
+
+    def _task_workspace_root(self) -> Path | None:
+        if not self._worker_task_id:
+            return None
+        return (Path(self._repo_root) / ".aca" / "active" / self._worker_task_id).resolve()
+
+    def _prepare_tool_call(
+        self,
+        tool_call: dict,
+        *,
+        turn_id: str,
+        current_mode: PermissionMode,
+    ) -> dict:
+        del turn_id, current_mode
+        tc = json.loads(json.dumps(tool_call))
+        fn = tc.setdefault("function", {})
+        tool_name = fn.get("name", "")
+        if tool_name not in {"write_task_file", "get_next_todo", "advance_todo"}:
+            return tc
+        try:
+            args = json.loads(fn.get("arguments", "{}") or "{}")
+        except json.JSONDecodeError:
+            return tc
+        if self._worker_task_id:
+            args["task_id"] = self._worker_task_id
+            fn["arguments"] = json.dumps(args)
+        return tc
+
+    def _validate_tool_call_args(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        turn_id: str,
+        current_mode: PermissionMode,
+    ) -> str | None:
+        del turn_id, current_mode
+        if tool_name in {"write_task_file", "get_next_todo", "advance_todo"}:
+            if args.get("task_id") != self._worker_task_id:
+                return "Worker may only use workspace tools for the pinned current task."
+
+        if tool_name == "write_task_file":
+            filename = str(args.get("filename", ""))
+            if filename not in _WORKER_RESULT_FILES:
+                return "Worker may only write findings.md or output.md in the current task workspace."
+
+        workspace = self._task_workspace_root()
+        repo_aca_active = (Path(self._repo_root) / ".aca" / "active").resolve()
+
+        if tool_name in {"read_file", "get_file_outline"}:
+            path_arg = str(args.get("path", ""))
+            target = Path(path_arg)
+            if not target.is_absolute():
+                target = (Path(self._repo_root) / path_arg).resolve()
+            if _path_is_within(target, repo_aca_active):
+                if not workspace or not _path_is_within(target, workspace):
+                    return "Worker may only inspect files in the pinned current task workspace."
+
+        if tool_name == "list_files":
+            path_arg = str(args.get("path", "."))
+            target = Path(path_arg)
+            if not target.is_absolute():
+                target = (Path(self._repo_root) / path_arg).resolve()
+            if _path_is_within(target, repo_aca_active):
+                if not workspace or not _path_is_within(target, workspace):
+                    return "Worker may only list files in the pinned current task workspace."
+
+        return None
+
+    def _reset_agent_turn_state(self) -> None:
+        super()._reset_agent_turn_state()
+        self._result_file_written = False
+
+    def _on_tool_completed(
+        self,
+        tool_name: str,
+        raw_args: str,
+        result: ToolResult,
+        *,
+        routed: bool,
+    ) -> None:
+        del routed
+        if not result.success or tool_name != "write_task_file":
+            return
+        try:
+            args = json.loads(raw_args) if raw_args else {}
+        except json.JSONDecodeError:
+            args = {}
+        if args.get("filename") in _WORKER_RESULT_FILES:
+            self._result_file_written = True
+
+    def _extra_pre_llm_steering(
+        self,
+        messages: list[dict],
+        tools: list | None,
+        tool_choice: str | None,
+        current_mode: PermissionMode,
+        *,
+        routing_tools_used: int,
+        routed: bool,
+        tool_calls_this_turn: int,
+    ) -> tuple[list | None, str | None, PermissionMode]:
+        del routing_tools_used, routed, tool_calls_this_turn
+        if self._result_file_written:
+            self._inject_steering(
+                messages,
+                SteeringJunction(
+                    key="worker_result_written",
+                    agent_msg=(
+                        "[STEERING — RESULT WRITTEN] Your result file is already written. "
+                        "Do not use any more tools. Stop now with a brief plain-text completion message."
+                    ),
+                    user_terminal_msg="[Worker] Result file written. Stopping.",
+                    restrict_to_mode=None,
+                    tool_choice="none",
+                ),
+            )
+            return None, "none", current_mode
+        return tools, tool_choice, current_mode

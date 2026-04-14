@@ -21,6 +21,7 @@ Register into a ToolRegistry via:
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -31,6 +32,20 @@ from aca.tools.read import _resolve_and_guard
 # ── Safety constants ──────────────────────────────────────────────────────────
 
 _DEFAULT_TIMEOUT_SECONDS = 120
+
+_SHELL_CONTROL_TOKENS = ("&&", "||", "|", ";", ">", "<", "`", "$(", "\n")
+_SAFE_EXECUTABLES = {
+    "python", "python3", "pytest",
+    "rg", "grep", "sed", "awk", "find", "ls", "pwd", "cat",
+    "git",
+    "make", "cmake",
+    "node", "npm", "npx", "pnpm", "yarn",
+    "uv", "go", "cargo", "swift", "xcodebuild",
+}
+_SAFE_GIT_SUBCOMMANDS = {
+    "status", "diff", "show", "log", "ls-files", "grep",
+    "rev-parse", "branch", "blame", "remote", "symbolic-ref", "describe",
+}
 
 # Patterns that are unconditionally blocked regardless of mode
 _BLOCKED_PATTERNS: list[re.Pattern] = [
@@ -51,6 +66,34 @@ _BLOCKED_PATTERNS: list[re.Pattern] = [
 
 def _check_command_safety(command: str) -> None:
     """Raise ValueError if the command matches any blocked pattern."""
+    if any(token in command for token in _SHELL_CONTROL_TOKENS):
+        raise ValueError(
+            "Command blocked by safety policy. Shell control operators, pipes, "
+            "redirection, command substitution, and multi-command chains are not allowed. "
+            "Run a single direct command instead."
+        )
+
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise ValueError(f"Command blocked by safety policy. Could not parse command: {exc}") from exc
+
+    if not argv:
+        raise ValueError("Command blocked by safety policy. Empty command.")
+
+    exe = Path(argv[0]).name.lower()
+    if exe not in _SAFE_EXECUTABLES:
+        raise ValueError(
+            f"Command blocked by safety policy. Executable '{argv[0]}' is not on the safe allowlist."
+        )
+
+    if exe == "git":
+        if len(argv) < 2 or argv[1] not in _SAFE_GIT_SUBCOMMANDS:
+            raise ValueError(
+                "Command blocked by safety policy. Only read-only git subcommands are allowed "
+                f"via run_command: {sorted(_SAFE_GIT_SUBCOMMANDS)}."
+            )
+
     for pattern in _BLOCKED_PATTERNS:
         if pattern.search(command):
             raise ValueError(

@@ -17,7 +17,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from aca.tools.registry import ToolCategory, ToolDefinition, ToolRegistry
+from aca.tools.registry import ToolCategory, ToolDefinition, ToolRegistry, _is_internal_repo_aca_path
 
 
 # ── Hard-excluded directory names ────────────────────────────────────────────────────
@@ -299,7 +299,7 @@ def list_files(
     entries = []
     for item in candidates:
         abs_str = str(item.resolve())
-        if abs_str in gitignored:
+        if abs_str in gitignored and not _is_internal_repo_aca_path(item, root):
             continue  # silently skip gitignored entries
         # Pattern filter — only applied to files
         if pattern and item.is_file() and not item.match(pattern):

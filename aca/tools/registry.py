@@ -79,6 +79,22 @@ _EXAMPLE_GUIDELINES_ALLOWED: dict[str, frozenset[str]] = {
 }
 
 
+def _is_internal_repo_aca_path(path: Path, repo_root: Path) -> bool:
+    """
+    Return True when `path` resolves inside the repo's internal `.aca/` folder.
+
+    Internal task artifacts are runtime-owned ACA files, so they should remain
+    readable even when `.aca/` is gitignored.
+    """
+    target = path.resolve()
+    aca_root = (repo_root.resolve() / ".aca").resolve()
+    try:
+        target.relative_to(aca_root)
+        return True
+    except ValueError:
+        return False
+
+
 # ── Gitignore helper ─────────────────────────────────────────────────────────
 
 def _is_gitignored(path: Path, repo_root: Path) -> bool:
@@ -198,10 +214,11 @@ class ToolRegistry:
 
     def add_to_read_allowlist(self, path_str: str, repo_root: str | Path = ".") -> str:
         """
-        Add a specific path to the per-session read allowlist.
+        Add a specific file or directory to the per-session read allowlist.
 
         Returns the resolved absolute path string so the caller can confirm
-        what was actually allowed.  Path must be inside the repo or absolute.
+        what was actually allowed. Path must be inside the repo or absolute.
+        Directory entries unlock their descendants recursively.
         """
         p = Path(path_str)
         if p.is_absolute():
@@ -210,6 +227,27 @@ class ToolRegistry:
             resolved = str((Path(repo_root) / path_str).resolve())
         self._read_allowlist.add(resolved)
         return resolved
+
+    def _is_path_read_allowed(self, path: Path, repo_root: Path) -> bool:
+        """
+        Return True if `path` is readable despite gitignore restrictions.
+
+        Readability can come from:
+          - the repo's internal `.aca/` runtime workspace
+          - an exact /allow entry
+          - a directory /allow entry that contains this path
+        """
+        target = path.resolve()
+        if _is_internal_repo_aca_path(target, repo_root):
+            return True
+        for allowed in self._read_allowlist:
+            allowed_path = Path(allowed).resolve()
+            try:
+                target.relative_to(allowed_path)
+                return True
+            except ValueError:
+                continue
+        return False
 
     # ── Registration ──────────────────────────────────────────────────────────
 
@@ -349,12 +387,13 @@ class ToolRegistry:
         if tool_name in ("read_file", "get_file_outline"):
             path_arg = args.get("path", "")
             repo_root_arg = args.get("repo_root", ".")
+            repo_root_path = Path(repo_root_arg).resolve()
             p = Path(path_arg)
             resolved_path = (
                 p.resolve() if p.is_absolute()
-                else (Path(repo_root_arg) / path_arg).resolve()
+                else (repo_root_path / path_arg).resolve()
             )
-            if str(resolved_path) not in self._read_allowlist:
+            if not self._is_path_read_allowed(resolved_path, repo_root_path):
                 # Fast-path: check if any path component is in the always-excluded set.
                 # Import here to avoid a circular import at module level.
                 from aca.tools.read import _ALWAYS_EXCLUDE_DIRS
@@ -367,7 +406,7 @@ class ToolRegistry:
                         "Use /allow <path> to explicitly unlock a specific file for this session.",
                         started_at, db, llm_call_id, turn_id, session_id, agent,
                     )
-                if _is_gitignored(resolved_path, Path(repo_root_arg).resolve()):
+                if _is_gitignored(resolved_path, repo_root_path):
                     return self._make_error_result(
                         tool_call_id, tool_name,
                         f"'{path_arg}' is listed in .gitignore and cannot be read. "

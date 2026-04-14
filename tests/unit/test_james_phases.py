@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from aca.agents.james import JamesAgent, JamesPhase
+from aca.agents.worker import WorkerAgent
 from aca.tools import build_registry
 from aca.tools.registry import PermissionMode, ToolResult
 
@@ -179,3 +180,175 @@ def test_task_artifact_phase_restricts_reads_to_templates_or_workspace(tmp_path:
         current_mode=PermissionMode.EDIT,
     )
     assert ok is None
+
+
+def test_worker_stops_after_writing_result_file(tmp_path: Path) -> None:
+    worker = WorkerAgent(
+        registry=build_registry(),
+        session_id="session-123",
+        repo_root=str(tmp_path),
+        thinking=False,
+        stream=False,
+    )
+
+    worker._on_tool_completed(
+        "write_task_file",
+        json.dumps({"task_id": "task-001", "filename": "findings.md", "content": "done"}),
+        _ok_result("write_task_file"),
+        routed=False,
+    )
+
+    tools, tool_choice, current_mode = worker._extra_pre_llm_steering(
+        messages=[],
+        tools=[],
+        tool_choice=None,
+        current_mode=PermissionMode.FULL,
+        routing_tools_used=0,
+        routed=False,
+        tool_calls_this_turn=3,
+    )
+
+    assert tools is None
+    assert tool_choice == "none"
+    assert current_mode == PermissionMode.FULL
+
+
+def test_worker_passes_through_tools_before_result_file(tmp_path: Path) -> None:
+    worker = WorkerAgent(
+        registry=build_registry(),
+        session_id="session-123",
+        repo_root=str(tmp_path),
+        current_task_id="task-001",
+        thinking=False,
+        stream=False,
+    )
+
+    original_tools = [{"type": "function", "function": {"name": "read_file"}}]
+    tools, tool_choice, current_mode = worker._extra_pre_llm_steering(
+        messages=[],
+        tools=original_tools,
+        tool_choice=None,
+        current_mode=PermissionMode.FULL,
+        routing_tools_used=0,
+        routed=False,
+        tool_calls_this_turn=0,
+    )
+
+    assert tools == original_tools
+    assert tool_choice is None
+    assert current_mode == PermissionMode.FULL
+
+
+def test_worker_prepare_tool_call_pins_workspace_task_id(tmp_path: Path) -> None:
+    worker = WorkerAgent(
+        registry=build_registry(),
+        session_id="session-123",
+        repo_root=str(tmp_path),
+        current_task_id="task-001",
+        thinking=False,
+        stream=False,
+    )
+
+    tc = {
+        "id": "call-1",
+        "type": "function",
+        "function": {
+            "name": "advance_todo",
+            "arguments": json.dumps({"task_id": "wrong-id", "item_index": 0, "action": "complete"}),
+        },
+    }
+
+    prepared = worker._prepare_tool_call(tc, turn_id="turn-1", current_mode=PermissionMode.FULL)
+    args = json.loads(prepared["function"]["arguments"])
+    assert args["task_id"] == "task-001"
+
+
+def test_worker_blocks_writing_non_result_artifacts(tmp_path: Path) -> None:
+    worker = WorkerAgent(
+        registry=build_registry(),
+        session_id="session-123",
+        repo_root=str(tmp_path),
+        current_task_id="task-001",
+        thinking=False,
+        stream=False,
+    )
+
+    err = worker._validate_tool_call_args(
+        "write_task_file",
+        {"task_id": "task-001", "filename": "plan.md", "content": "nope"},
+        turn_id="turn-1",
+        current_mode=PermissionMode.FULL,
+    )
+    assert err is not None
+
+
+def test_worker_blocks_reading_other_task_workspace(tmp_path: Path) -> None:
+    worker = WorkerAgent(
+        registry=build_registry(),
+        session_id="session-123",
+        repo_root=str(tmp_path),
+        current_task_id="task-001",
+        thinking=False,
+        stream=False,
+    )
+    current = tmp_path / ".aca" / "active" / "task-001"
+    other = tmp_path / ".aca" / "active" / "task-002"
+    current.mkdir(parents=True)
+    other.mkdir(parents=True)
+
+    err = worker._validate_tool_call_args(
+        "read_file",
+        {"path": str(other / "task.md")},
+        turn_id="turn-1",
+        current_mode=PermissionMode.FULL,
+    )
+    assert err is not None
+
+    ok = worker._validate_tool_call_args(
+        "read_file",
+        {"path": str(current / "task.md")},
+        turn_id="turn-1",
+        current_mode=PermissionMode.FULL,
+    )
+    assert ok is None
+
+
+def test_worker_blocks_listing_other_task_workspace(tmp_path: Path) -> None:
+    worker = WorkerAgent(
+        registry=build_registry(),
+        session_id="session-123",
+        repo_root=str(tmp_path),
+        current_task_id="task-001",
+        thinking=False,
+        stream=False,
+    )
+    (tmp_path / ".aca" / "active" / "task-001").mkdir(parents=True)
+    other = tmp_path / ".aca" / "active" / "task-999"
+    other.mkdir(parents=True)
+
+    err = worker._validate_tool_call_args(
+        "list_files",
+        {"path": str(other)},
+        turn_id="turn-1",
+        current_mode=PermissionMode.FULL,
+    )
+    assert err is not None
+
+
+def test_worker_blocks_workspace_tools_for_other_task_id(tmp_path: Path) -> None:
+    worker = WorkerAgent(
+        registry=build_registry(),
+        session_id="session-123",
+        repo_root=str(tmp_path),
+        current_task_id="task-001",
+        thinking=False,
+        stream=False,
+    )
+
+    err = worker._validate_tool_call_args(
+        "get_next_todo",
+        {"task_id": "task-002"},
+        turn_id="turn-1",
+        current_mode=PermissionMode.FULL,
+    )
+    assert err is not None

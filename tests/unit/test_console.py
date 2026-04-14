@@ -37,7 +37,7 @@ def test_quiet_console_streams_assistant_tokens_cleanly() -> None:
     agent_console = AgentConsole(console=console, verbosity="quiet")
 
     agent_console.begin_user_turn()
-    agent_console.streaming_token("Hello")
+    agent_console.streaming_token("**Hello**")
     agent_console.streaming_token(" world")
     agent_console.streaming_done(stop_reason="end_turn", tokens=12, latency_ms=10)
 
@@ -45,9 +45,47 @@ def test_quiet_console_streams_assistant_tokens_cleanly() -> None:
 
     assert "ACA" in rendered
     assert "Hello world" in rendered
+    assert "**Hello**" not in rendered
     assert "stop=" not in rendered
     assert agent_console.consume_streamed_response_flag() is True
     assert agent_console.consume_streamed_response_flag() is False
+
+
+def test_quiet_console_flushes_stream_as_markdown_before_tool_updates() -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, highlight=False)
+    agent_console = AgentConsole(console=console, verbosity="quiet")
+
+    agent_console.begin_user_turn()
+    agent_console.streaming_token("## Heading")
+    agent_console.tool_call("read_file", {"path": "README.md"})
+    agent_console.tool_result(
+        "read_file",
+        success=True,
+        latency_ms=4,
+        output={"path": "README.md", "lines_returned": 10},
+    )
+
+    rendered = buffer.getvalue()
+
+    assert "ACA" in rendered
+    assert "Heading" in rendered
+    assert "## Heading" not in rendered
+    assert "Reviewed README.md" in rendered
+
+
+def test_quiet_console_flushes_plain_sentence_before_stream_end() -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, highlight=False)
+    agent_console = AgentConsole(console=console, verbosity="quiet")
+
+    agent_console.begin_user_turn()
+    agent_console.streaming_token("This is a plain response sentence. ")
+
+    rendered = buffer.getvalue()
+
+    assert "ACA" in rendered
+    assert "This is a plain response sentence." in rendered
 
 
 def test_tool_result_accepts_tool_name_keyword() -> None:
