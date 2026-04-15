@@ -373,10 +373,11 @@ _COMMANDS: dict[str, str] = {
     "/show":     "Show this help listing all commands",
     "/thinking": "Toggle extended thinking on / off",
     "/model":    "List all models and switch the active one",
+    "/new":      "Start a fresh session and keep this one in history",
     "/mode":     "Switch permission mode (read / edit / full)",
     "/allow":    "Unlock a gitignored file for reading this session: /allow <path>",
     "/clear":    "Clear conversation history and start fresh in this session",
-    "/delete":   "Delete this session entirely and start a new one",
+    "/delete":   "Legacy alias for /new",
     "/list":     "List all previous conversations and resume any one",
     "/history":  "Print a preview of all turns in the current conversation",
     "/export":   "Export the current conversation to a Markdown file",
@@ -401,8 +402,19 @@ def _cmd_show(con: Console) -> None:
     con.print()
 
 
-def _cmd_thinking(con: Console, state: dict) -> None:
+def _provider_for_model(model: str) -> ProviderName:
+    if any(
+        model == getattr(OpenAIModels, attr)
+        for attr in vars(OpenAIModels)
+        if not attr.startswith("_")
+    ):
+        return ProviderName.OPENAI
+    return ProviderName.OPENROUTER
+
+
+def _cmd_thinking(con: Console, state: dict, james: JamesAgent) -> None:
     state["thinking"] = not state["thinking"]
+    james._thinking = state["thinking"]
     status = "[green]ON[/green]" if state["thinking"] else "[red]OFF[/red]"
     con.print(f"\n  Thinking: {status}\n")
 
@@ -426,7 +438,13 @@ def _cmd_allow(
     con.print(f"\n  [green]Allowed for this session:[/] {resolved}\n")
 
 
-def _cmd_model(con: Console, state: dict) -> None:
+def _cmd_model(
+    con: Console,
+    state: dict,
+    james: JamesAgent,
+    db: Any,
+    session_id: str,
+) -> None:
     models = _all_models()
     table = Table(
         title="Available Models",
@@ -449,12 +467,28 @@ def _cmd_model(con: Console, state: dict) -> None:
     try:
         idx = int(raw) - 1
         if 0 <= idx < len(models):
-            state["model"] = models[idx][1]
-            con.print(f"\n  Model → [bright_cyan]{state['model']}[/]\n")
+            selected_model = models[idx][1]
+            state["model"] = selected_model
+            james._model = selected_model
+            james._provider = _provider_for_model(selected_model)
+            db.execute(
+                "UPDATE sessions SET model = ? WHERE session_id = ?",
+                (selected_model, session_id),
+            )
+            db.commit()
+            con.print(
+                f"\n  Model → [bright_cyan]{state['model']}[/]"
+            )
         else:
             con.print("\n  [red]Invalid selection.[/]\n")
     except ValueError:
         con.print("\n  [red]Invalid input.[/]\n")
+
+
+def _cmd_new(con: Console, db: Any, session_id: str) -> bool:
+    _end_session(db, session_id)
+    con.print("\n  [yellow]Starting a new session...[/]\n")
+    return True
 
 
 def _cmd_list(
@@ -674,15 +708,6 @@ def _build_james(
     registry = build_registry()
     full_context = f"User's name: {user_name}\n\n{repo_context}" if user_name else repo_context
     # Infer provider from model string — OpenAI models don't contain "/"
-    provider = (
-        ProviderName.OPENAI
-        if not "/" in model and any(
-            model == getattr(OpenAIModels, a)
-            for a in vars(OpenAIModels)
-            if not a.startswith("_")
-        )
-        else ProviderName.OPENROUTER
-    )
     return JamesAgent(
         registry=registry,
         permission_mode=PermissionMode.EDIT,
@@ -693,7 +718,7 @@ def _build_james(
         session_id=session_id,
         console=agent_console,
         repo_context=full_context,
-        provider=provider,
+        provider=_provider_for_model(model),
         repo_root=str(repo_path),
     )
 
@@ -710,7 +735,7 @@ def _run_session(
 ) -> bool:
     """
     Run one REPL session. Returns True if the caller should start a new session
-    (/delete), False if ACA should exit entirely.
+    (/new or /delete), False if ACA should exit entirely.
     """
     session_id = str(uuid.uuid4())
     _create_session(db, session_id, repo_path, state["model"], user_name)
@@ -762,29 +787,11 @@ def _run_session(
             continue
 
         if cmd == "/thinking":
-            _cmd_thinking(con, state)
-            # Rebuild james with new thinking flag
-            james._thinking = state["thinking"]
+            _cmd_thinking(con, state, james)
             continue
 
         if cmd == "/model":
-            _cmd_model(con, state)
-            # Rebuild james so model change takes effect immediately
-            _end_session(db, session_id)
-            session_id = str(uuid.uuid4())
-            _create_session(db, session_id, repo_path, state["model"], user_name)
-            james = _build_james(
-                session_id=session_id,
-                repo_path=repo_path,
-                model=state["model"],
-                thinking=state["thinking"],
-                db=db,
-                agent_console=agent_console,
-                repo_context=repo_context,
-                user_name=user_name,
-            )
-            turn_count = 0
-            con.print(f"  [dim]New session started with [bright_cyan]{state['model']}[/].[/]\n")
+            _cmd_model(con, state, james, db, session_id)
             continue
 
         if cmd == "/mode":
@@ -800,10 +807,8 @@ def _run_session(
             turn_count = 0
             continue
 
-        if cmd == "/delete":
-            _end_session(db, session_id)
-            con.print("\n  [yellow]Session deleted.[/] Starting new session...\n")
-            return True  # restart
+        if cmd in ("/new", "/delete"):
+            return _cmd_new(con, db, session_id)
 
         if cmd == "/history":
             _cmd_history(con, james)

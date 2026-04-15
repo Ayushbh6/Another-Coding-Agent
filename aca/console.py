@@ -28,6 +28,7 @@ import time
 from typing import Any
 
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.panel import Panel
@@ -93,6 +94,8 @@ class AgentConsole:
         self._streamed_response_in_turn = False
         self._quiet_response_started = False
         self._status: Status | None = None
+        self._live: Live | None = None
+        self._live_buf: str = ""
 
     def begin_user_turn(self) -> None:
         """Reset per-turn UI state before starting a new user-visible turn."""
@@ -158,10 +161,11 @@ class AgentConsole:
         self._streamed_response_in_turn = True
         if self._verbosity == "quiet":
             self._flush_thinking_stream()  # close thinking block if one was open
-            self._ensure_quiet_response_header()
-            self._stream_buf.append(token)
+            self._ensure_quiet_live_display()
             self._stream_started = True
-            self._flush_quiet_stream_blocks()
+            self._live_buf += token
+            if self._live is not None:
+                self._live.update(Padding(Markdown(self._live_buf), (0, 0, 0, 2)))
             return
         self._flush_thinking_stream()  # close thinking block if one was open
         if not self._stream_started:
@@ -200,9 +204,7 @@ class AgentConsole:
         """Call once when the stream is complete."""
         self._flush_thinking_stream()
         if self._verbosity == "quiet":
-            self._flush_quiet_stream_blocks(force=True)
-            if self._quiet_response_started:
-                self._con.print()
+            self._stop_live()
             self._stream_buf.clear()
             self._stream_started = False
             return
@@ -217,7 +219,7 @@ class AgentConsole:
         """If a stream was partially printed, close it before printing anything else."""
         self._flush_thinking_stream()
         if self._verbosity == "quiet":
-            self._flush_quiet_stream_blocks(force=True)
+            self._stop_live()
             self._stream_buf.clear()
             self._stream_started = False
             return
@@ -257,46 +259,7 @@ class AgentConsole:
     def _split_renderable_markdown(self, text: str, *, force: bool) -> tuple[str, str]:
         if force:
             return text, ""
-
-        in_code_fence = False
-        line_start = 0
-        cutoff = 0
-        idx = 0
-        length = len(text)
-
-        while idx < length:
-            if text[idx] != "\n":
-                idx += 1
-                continue
-
-            line = text[line_start:idx]
-            stripped = line.lstrip()
-
-            if stripped.startswith("```"):
-                in_code_fence = not in_code_fence
-                if not in_code_fence:
-                    cutoff = idx + 1
-            elif not in_code_fence:
-                if idx + 1 < length and text[idx + 1] == "\n":
-                    cutoff = idx + 2
-                elif (
-                    stripped.startswith("#")
-                    or stripped.startswith("- ")
-                    or stripped.startswith("* ")
-                    or stripped.startswith("> ")
-                    or _ORDERED_LIST_RE.match(stripped)
-                ):
-                    cutoff = idx + 1
-
-            line_start = idx + 1
-            idx += 1
-
-        if cutoff == 0:
-            sentence_cutoff = self._sentence_cutoff(text)
-            if sentence_cutoff > 0:
-                cutoff = sentence_cutoff
-
-        return text[:cutoff], text[cutoff:]
+        return "", text
 
     def _sentence_cutoff(self, text: str) -> int:
         if len(text) < 24:
@@ -328,6 +291,31 @@ class AgentConsole:
         self._con.print()
         self._con.print(Text("  ACA", style=_QUIET_LABEL_STYLE))
         self._quiet_response_started = True
+
+    def _ensure_quiet_live_display(self) -> None:
+        """Start the Live markdown display on first token in quiet mode."""
+        if self._quiet_response_started:
+            return
+        self._stop_status()
+        self._con.print()
+        self._con.print(Text("  ACA", style=_QUIET_LABEL_STYLE))
+        self._quiet_response_started = True
+        self._live_buf = ""
+        self._live = Live(
+            Padding(Markdown(""), (0, 0, 0, 2)),
+            console=self._con,
+            refresh_per_second=15,
+            vertical_overflow="visible",
+        )
+        self._live.start()
+
+    def _stop_live(self) -> None:
+        """Stop the Live display if active, leaving the rendered markdown on screen."""
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+        self._live_buf = ""
+        self._quiet_response_started = False
 
     # ── Tool call / result ────────────────────────────────────────────────────
 

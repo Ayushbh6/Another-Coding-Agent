@@ -5,8 +5,11 @@ from pathlib import Path
 
 from rich.console import Console
 
-from aca.cli import _build_james
+from aca.cli import _build_james, _cmd_model, _cmd_new, _cmd_thinking
 from aca.console import AgentConsole
+from aca.db import open_db
+from aca.llm.models import OpenAIModels, OpenRouterModels
+from aca.llm.providers import ProviderName
 from aca.tools import build_registry
 from aca.tools.registry import PermissionMode
 
@@ -56,3 +59,105 @@ def test_build_james_starts_with_registered_tools(tmp_path: Path) -> None:
     assert "search_repo" in read_names
     assert "create_task_workspace" in set(james._registry.list_names(PermissionMode.EDIT))
     assert james._stream is True
+
+
+def test_cmd_model_switches_live_agent_without_resetting_history(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    capture = StringIO()
+    console = Console(file=capture, force_terminal=False, color_system=None, highlight=False)
+    agent_console = AgentConsole(console=console, verbosity="quiet")
+    db = open_db(tmp_path / "aca.db")
+    db.execute(
+        """
+        INSERT INTO sessions (session_id, repo_path, started_at, model, permission_mode, user_name)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        ("session-123", str(tmp_path), 0, OpenRouterModels.minimax_2_7, "edit", "Ayush"),
+    )
+    db.commit()
+
+    james = _build_james(
+        session_id="session-123",
+        repo_path=tmp_path,
+        model=OpenRouterModels.minimax_2_7,
+        thinking=False,
+        db=db,
+        agent_console=agent_console,
+        repo_context="Repo path: test",
+        user_name="Ayush",
+    )
+    james._history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    james._history_meta = [{"turn_id": "turn-1"}]
+    state = {"model": OpenRouterModels.minimax_2_7, "thinking": False}
+
+    monkeypatch.setattr("aca.cli.Prompt.ask", lambda *args, **kwargs: "6")
+
+    _cmd_model(console, state, james, db, "session-123")
+
+    assert state["model"] == OpenAIModels.GPT_5
+    assert james._model == OpenAIModels.GPT_5
+    assert james._provider == ProviderName.OPENAI
+    assert james._history == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    assert james._history_meta == [{"turn_id": "turn-1"}]
+    row = db.execute(
+        "SELECT model FROM sessions WHERE session_id = ?",
+        ("session-123",),
+    ).fetchone()
+    assert row["model"] == OpenAIModels.GPT_5
+
+
+def test_cmd_thinking_updates_state_and_live_agent(tmp_path: Path) -> None:
+    capture = StringIO()
+    console = Console(file=capture, force_terminal=False, color_system=None, highlight=False)
+    agent_console = AgentConsole(console=console, verbosity="quiet")
+
+    james = _build_james(
+        session_id="session-123",
+        repo_path=tmp_path,
+        model=OpenRouterModels.minimax_2_7,
+        thinking=False,
+        db=None,
+        agent_console=agent_console,
+        repo_context="Repo path: test",
+        user_name="Ayush",
+    )
+    state = {"model": OpenRouterModels.minimax_2_7, "thinking": False}
+
+    _cmd_thinking(console, state, james)
+    assert state["thinking"] is True
+    assert james._thinking is True
+
+    _cmd_thinking(console, state, james)
+    assert state["thinking"] is False
+    assert james._thinking is False
+
+
+def test_cmd_new_ends_current_session_and_requests_restart(tmp_path: Path) -> None:
+    capture = StringIO()
+    console = Console(file=capture, force_terminal=False, color_system=None, highlight=False)
+    db = open_db(tmp_path / "aca.db")
+    db.execute(
+        """
+        INSERT INTO sessions (session_id, repo_path, started_at, model, permission_mode)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("session-123", str(tmp_path), 0, OpenRouterModels.minimax_2_7, "edit"),
+    )
+    db.commit()
+
+    restart = _cmd_new(console, db, "session-123")
+
+    assert restart is True
+    row = db.execute(
+        "SELECT ended_at FROM sessions WHERE session_id = ?",
+        ("session-123",),
+    ).fetchone()
+    assert row["ended_at"] is not None

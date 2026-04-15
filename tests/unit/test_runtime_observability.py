@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+from io import StringIO
 from pathlib import Path
+
+from rich.console import Console
 
 from aca.agents.base_agent import BaseAgent
 from aca.cli import _TASK_TTL_MS, _archive_expired_tasks
+from aca.console import AgentConsole
 from aca.llm.client import LLMResponse
 from aca.db import open_db
 from aca.tools import build_registry
@@ -126,6 +130,71 @@ def test_turn_end_persists_route_and_task_id(tmp_path: Path, monkeypatch) -> Non
     agent.run_turn("hello")
     row = db.execute("SELECT route, task_id FROM turns").fetchone()
     assert tuple(row) == ("analysis_simple", "task-123")
+
+
+def test_streaming_run_turn_flushes_quiet_console_output(tmp_path: Path, monkeypatch) -> None:
+    db = open_db(tmp_path / "aca.db")
+    db.execute(
+        """
+        INSERT INTO sessions (session_id, repo_path, started_at, model, permission_mode)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("session-1", str(tmp_path), 0, "test-model", "read"),
+    )
+    db.commit()
+
+    capture = StringIO()
+    console = Console(file=capture, force_terminal=False, color_system=None, highlight=False)
+    agent_console = AgentConsole(console=console, verbosity="quiet")
+
+    agent = _DummyAgent(
+        registry=build_registry(),
+        session_id="session-1",
+        db=db,
+        repo_root=str(tmp_path),
+        stream=True,
+        console=agent_console,
+    )
+
+    class _Delta:
+        def __init__(self, content: str) -> None:
+            self.content = content
+            self.reasoning_content = None
+
+    class _Choice:
+        def __init__(self, content: str) -> None:
+            self.delta = _Delta(content)
+            self.finish_reason = None
+
+    class _Chunk:
+        def __init__(self, content: str) -> None:
+            self.choices = [_Choice(content)]
+
+    def _fake_call_llm(**kwargs):
+        cb = kwargs["stream_callback"]
+        cb(_Chunk("Hello"))
+        cb(_Chunk(" world"))
+        return LLMResponse(
+            call_id="call-1",
+            content="Hello world",
+            tool_calls=[],
+            stop_reason="end_turn",
+            thinking_blocks=[],
+            input_tokens=1,
+            output_tokens=2,
+            latency_ms=1,
+            model="test-model",
+            raw=None,
+        )
+
+    monkeypatch.setattr("aca.agents.base_agent.call_llm", _fake_call_llm)
+
+    agent_console.begin_user_turn()
+    agent.run_turn("hello")
+
+    rendered = capture.getvalue()
+    assert "ACA" in rendered
+    assert "Hello world" in rendered
 
 
 def test_archive_expired_tasks_moves_completed_workspace_to_users_root(tmp_path: Path, monkeypatch) -> None:

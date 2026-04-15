@@ -74,7 +74,7 @@ def test_quiet_console_flushes_stream_as_markdown_before_tool_updates() -> None:
     assert "Reviewed README.md" in rendered
 
 
-def test_quiet_console_flushes_plain_sentence_before_stream_end() -> None:
+def test_quiet_console_buffers_plain_sentence_until_stream_end() -> None:
     buffer = StringIO()
     console = Console(file=buffer, force_terminal=False, color_system=None, highlight=False)
     agent_console = AgentConsole(console=console, verbosity="quiet")
@@ -85,7 +85,7 @@ def test_quiet_console_flushes_plain_sentence_before_stream_end() -> None:
     rendered = buffer.getvalue()
 
     assert "ACA" in rendered
-    assert "This is a plain response sentence." in rendered
+    assert "This is a plain response sentence." not in rendered
 
 
 def test_quiet_console_shows_aca_header_on_first_token_even_before_flush() -> None:

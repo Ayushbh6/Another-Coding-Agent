@@ -206,6 +206,37 @@ _PSEUDO_PARAM_RE = re.compile(
 )
 
 
+def _build_extra_body(
+    *,
+    model: str,
+    provider: ProviderName,
+    thinking: bool,
+) -> dict[str, Any] | None:
+    """
+    Build provider/model-specific non-standard request params.
+
+    Kimi K2.5 currently defaults to thinking-enabled and requires the
+    Moonshot-specific ``thinking`` control to disable it. On OpenRouter, we
+    also ask reasoning-capable models to exclude reasoning tokens from the
+    visible output when ACA thinking is off.
+    """
+    extra_body: dict[str, Any] = {}
+    model_lc = model.lower()
+
+    if "moonshotai/kimi-k2.5" in model_lc:
+        if provider == ProviderName.OPENROUTER:
+            extra_body["reasoning"] = (
+                {"enabled": True}
+                if thinking
+                else {"effort": "none", "exclude": True}
+            )
+        extra_body["thinking"] = {
+            "type": "enabled" if thinking else "disabled",
+        }
+
+    return extra_body or None
+
+
 def _parse_pseudo_tool_markup(content: str | None) -> tuple[str | None, list[dict]]:
     """
     Parse Minimax-style pseudo-tool XML emitted as plain text.
@@ -393,8 +424,13 @@ def call_llm(
         kwargs["temperature"] = temperature
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
-    if thinking:
-        kwargs["extra_body"] = {"reasoning": {"enabled": True}}
+    extra_body = _build_extra_body(
+        model=model,
+        provider=prov.name,
+        thinking=thinking,
+    )
+    if extra_body:
+        kwargs["extra_body"] = extra_body
 
     started_at = int(time.time() * 1000)
     call_id = str(uuid.uuid4())

@@ -221,6 +221,12 @@ class BaseAgent(ABC):
             call_index += 1
             cumulative_input_tokens += resp.input_tokens
             cumulative_output_tokens += resp.output_tokens
+            if self._console and self._stream:
+                self._console.streaming_done(
+                    stop_reason=resp.stop_reason,
+                    tokens=resp.output_tokens,
+                    latency_ms=resp.latency_ms,
+                )
 
             # ── Threshold check: enter compaction phase ───────────────────────
             if (
